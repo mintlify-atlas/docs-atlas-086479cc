@@ -208,7 +208,7 @@ The platform supports two operational modes:
 
 ### Data Flow
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │  Frontend (React SPA)                                           │
 │  ┌──────────────────┐        ┌──────────────────┐               │
@@ -394,7 +394,7 @@ implementation 'net.javacrumbs.shedlock:shedlock-provider-jdbc-template:6.3.0'
 
 The entire AWS infrastructure is defined using Terraform with a modular architecture:
 
-```
+```text
 infrastructure/terraform/
 ├── main.tf                    # Root orchestration
 ├── modules/
@@ -420,7 +420,7 @@ infrastructure/terraform/
 
 ### Network Isolation
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │  VPC (10.0.0.0/16)                                              │
 │                                                                 │
@@ -516,7 +516,7 @@ infrastructure/terraform/
 
 The backend tracks average redirect latency using Welford's online algorithm, which computes running averages without storing historical data:
 
-```
+```text
 μₙ = μₙ₋₁ + (xₙ − μₙ₋₁) / n
 
 Where:
@@ -777,7 +777,7 @@ deployment_minimum_healthy_percent = 50   # Maintain at least 50% capacity
 
 ### Multi-AZ Deployment
 
-```
+```text
 Availability Zone A              Availability Zone B
 ┌──────────────────────┐        ┌──────────────────────┐
 │                      │        │                      │
