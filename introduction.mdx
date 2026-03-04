@@ -1,0 +1,168 @@
+---
+title: Introduction
+description: Welcome to ADMA Cloud Administration - a production-ready URL shortener with complete AWS infrastructure
+mode: custom
+---
+
+<div className="relative overflow-hidden bg-gradient-to-br from-[#1e40af] via-[#2563eb] to-[#3b82f6] dark:from-[#1e3a8a] dark:via-[#1e40af] dark:to-[#1d4ed8] py-20">
+  <div className="absolute inset-0 bg-[url('/grid.svg')] opacity-10"></div>
+  <div className="relative max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+    <div className="text-center">
+      <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6">
+        ADMA Cloud Administration
+      </h1>
+      <p className="text-lg sm:text-xl text-blue-100 max-w-2xl mx-auto mb-8">
+        Deploy a production-ready URL shortener on AWS with Spring Boot, React, and Terraform infrastructure as code
+      </p>
+      <div className="flex flex-wrap gap-4 justify-center">
+        <a
+          href="/quickstart"
+          className="inline-flex items-center px-6 py-3 bg-white text-[#2563eb] font-semibold rounded-lg hover:bg-blue-50 transition-colors"
+        >
+          Get Started
+        </a>
+        <a
+          href="/architecture"
+          className="inline-flex items-center px-6 py-3 border-2 border-white/30 bg-white/10 text-white font-semibold rounded-lg hover:bg-white/20 transition-colors"
+        >
+          View Architecture
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Quick start</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Get your URL shortener running locally in minutes with Docker Compose
+  </p>
+
+  <Steps>
+    <Step title="Clone the repository">
+      Clone the ADMA repository to your local machine:
+      
+      ```bash
+      git clone https://github.com/AitorMT/ADMA.git
+      cd ADMA/adma-sa2-sa3
+      ```
+    </Step>
+
+    <Step title="Start the services">
+      Launch the complete stack with Docker Compose:
+      
+      ```bash
+      docker compose up --build
+      ```
+      
+      This starts PostgreSQL, the Spring Boot backend, and the React frontend.
+    </Step>
+
+    <Step title="Access the application">
+      Open your browser and navigate to the frontend:
+      
+      - **Frontend**: http://localhost
+      - **Backend API**: http://localhost:8080
+      
+      <Note>
+        The backend uses JWT authentication. You can register a new account or create anonymous short URLs with an 8-hour TTL.
+      </Note>
+    </Step>
+  </Steps>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Explore by topic</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Learn about deployment, infrastructure, and operations
+  </p>
+
+  <CardGroup cols={3}>
+    <Card title="Deploy to AWS" icon="aws" href="/deployment/aws-setup">
+      Step-by-step guide to deploy on AWS ECS Fargate with RDS and Application Load Balancer
+    </Card>
+    <Card title="Terraform Modules" icon="cube" href="/infrastructure/terraform">
+      Infrastructure as code with modular Terraform configuration for networking, IAM, and ECS
+    </Card>
+    <Card title="API Reference" icon="code" href="/api/authentication">
+      Complete REST API documentation with authentication, URL management, and analytics
+    </Card>
+    <Card title="Local Development" icon="laptop-code" href="/local-development">
+      Set up your development environment with Docker Compose and hot reload
+    </Card>
+    <Card title="CI/CD Pipeline" icon="circle-nodes" href="/operations/cicd">
+      Automated deployments with GitHub Actions, ECR, and ECS service updates
+    </Card>
+    <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+      CloudWatch logs, metrics, and health checks for production observability
+    </Card>
+  </CardGroup>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Key features</h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Production-ready infrastructure with enterprise-grade features
+  </p>
+
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Serverless Architecture</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        AWS ECS Fargate with no EC2 instances to manage. Auto-scaling and pay-per-use pricing.
+      </p>
+    </div>
+    
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">JWT Authentication</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Stateless authentication with HS256 signing. Supports both authenticated and anonymous users.
+      </p>
+    </div>
+    
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Infrastructure as Code</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Complete Terraform modules for VPC, subnets, security groups, RDS, ECS, and ALB.
+      </p>
+    </div>
+    
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Real-time Analytics</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Track redirects, measure latency with Welford's algorithm, and view public statistics.
+      </p>
+    </div>
+    
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Automated Cleanup</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Scheduled jobs with ShedLock distributed locking to expire anonymous URLs after 8 hours.
+      </p>
+    </div>
+    
+    <div className="border border-gray-200 dark:border-[#27272a] rounded-lg p-6 bg-gray-50 dark:bg-[#1a1d27]">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Modern Frontend</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        React 18 with TypeScript, Vite, Tailwind CSS, and shadcn/ui components.
+      </p>
+    </div>
+  </div>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-r from-[#2563eb] to-[#3b82f6] dark:from-[#1e40af] dark:to-[#2563eb] rounded-2xl p-8 text-center">
+    <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4">
+      Ready to deploy?
+    </h2>
+    <p className="text-base text-blue-100 mb-6 max-w-2xl mx-auto">
+      Follow our comprehensive deployment guide to get your URL shortener running on AWS in under an hour.
+    </p>
+    <a
+      href="/deployment/aws-setup"
+      className="inline-flex items-center px-6 py-3 bg-white text-[#2563eb] font-semibold rounded-lg hover:bg-blue-50 transition-colors"
+    >
+      Start Deploying
+    </a>
+  </div>
+</div>

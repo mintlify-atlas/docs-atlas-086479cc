@@ -1,0 +1,632 @@
+---
+title: Security Groups
+description: Security group rules for ALB, ECS services, RDS database, and VPC endpoints with actual configurations
+---
+
+Security groups control network traffic at the resource level. The ADMA infrastructure implements a least-privilege security model with explicit allow rules and no direct internet access to backend services.
+
+## Security Architecture
+
+### Traffic Flow Overview
+
+```
+Internet
+   │
+   ├─ HTTP/HTTPS (80/443)
+   ▼
+[sg-alb] Application Load Balancer
+   │
+   ├─ Port 80 → Frontend
+   ▼
+[sg-frontend] Frontend Tasks (Nginx)
+   │
+   ├─ Port 8080 → Backend
+   ├─ Port 443 → VPC Endpoints
+   ▼
+[sg-backend] Backend Tasks (Spring Boot)
+   │
+   ├─ Port 5432 → Database
+   ├─ Port 443 → VPC Endpoints
+   ▼
+[sg-db] RDS PostgreSQL
+```
+
+## Security Groups Module
+
+All security groups are created in the `modules/security` module:
+
+```hcl
+# modules/security/main.tf
+
+locals {
+  name_prefix = "${var.project_name}-${var.environment}"
+}
+
+# Five security groups with distinct responsibilities
+resource "aws_security_group" "alb" { ... }
+resource "aws_security_group" "frontend" { ... }
+resource "aws_security_group" "backend" { ... }
+resource "aws_security_group" "db" { ... }
+resource "aws_security_group" "vpc_endpoint" { ... }
+```
+
+## ALB Security Group
+
+The ALB security group allows public access to the application:
+
+```hcl
+resource "aws_security_group" "alb" {
+  name        = "${local.name_prefix}-alb-sg"
+  description = "Allow public ingress to frontend ALB"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-alb-sg"
+  })
+}
+```
+
+### Ingress Rules
+
+<Tabs>
+  <Tab title="HTTP (Port 80)">
+    ```hcl
+    resource "aws_vpc_security_group_ingress_rule" "alb_http" {
+      for_each = toset(var.alb_ingress_cidrs)
+
+      security_group_id = aws_security_group.alb.id
+      ip_protocol       = "tcp"
+      from_port         = 80
+      to_port           = 80
+      cidr_ipv4         = each.value
+      description       = "Public HTTP access"
+    }
+    ```
+
+    **Default**: Allows `0.0.0.0/0` (all internet traffic)
+
+    **Customization**: Restrict to specific CIDR blocks:
+    ```hcl
+    alb_ingress_cidrs = [
+      "203.0.113.0/24",  # Office network
+      "198.51.100.0/24"  # VPN network
+    ]
+    ```
+  </Tab>
+  <Tab title="HTTPS (Port 443)">
+    ```hcl
+    resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+      for_each = var.allow_https_from_cidr ? toset(var.alb_ingress_cidrs) : toset([])
+
+      security_group_id = aws_security_group.alb.id
+      ip_protocol       = "tcp"
+      from_port         = 443
+      to_port           = 443
+      cidr_ipv4         = each.value
+      description       = "Public HTTPS access"
+    }
+    ```
+
+    **Conditional**: Only created when `enable_https = true`
+  </Tab>
+</Tabs>
+
+### Egress Rules
+
+ALB can only communicate with frontend tasks:
+
+```hcl
+resource "aws_vpc_security_group_egress_rule" "alb_to_frontend" {
+  security_group_id            = aws_security_group.alb.id
+  ip_protocol                  = "tcp"
+  from_port                    = var.frontend_port
+  to_port                      = var.frontend_port
+  referenced_security_group_id = aws_security_group.frontend.id
+  description                  = "ALB forwards traffic only to frontend service"
+}
+```
+
+<Note>
+**Security**: ALB has NO direct route to backend. This enforces frontend as the entry point.
+</Note>
+
+### Summary Table
+
+| Direction | Protocol | Port | Source/Destination | Description |
+|-----------|----------|------|-------------------|-------------|
+| Inbound | TCP | 80 | `0.0.0.0/0` | Public HTTP |
+| Inbound | TCP | 443 | `0.0.0.0/0` | Public HTTPS (if enabled) |
+| Outbound | TCP | 80 | `sg-frontend` | Forward to frontend |
+
+## Frontend Security Group
+
+The frontend security group isolates the Nginx containers:
+
+```hcl
+resource "aws_security_group" "frontend" {
+  name        = "${local.name_prefix}-frontend-sg"
+  description = "Allow ALB ingress to frontend tasks"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-frontend-sg"
+  })
+}
+```
+
+### Ingress Rules
+
+Only the ALB can reach frontend tasks:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "frontend_from_alb" {
+  security_group_id            = aws_security_group.frontend.id
+  ip_protocol                  = "tcp"
+  from_port                    = var.frontend_port
+  to_port                      = var.frontend_port
+  referenced_security_group_id = aws_security_group.alb.id
+  description                  = "Allow ALB traffic to frontend"
+}
+```
+
+### Egress Rules
+
+Frontend can communicate with backend, VPC endpoints, and DNS:
+
+<Tabs>
+  <Tab title="To Backend">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "frontend_to_backend" {
+      security_group_id            = aws_security_group.frontend.id
+      ip_protocol                  = "tcp"
+      from_port                    = var.backend_port
+      to_port                      = var.backend_port
+      referenced_security_group_id = aws_security_group.backend.id
+      description                  = "Frontend may call backend service"
+    }
+    ```
+
+    **Purpose**: Nginx reverse proxy forwards `/api/*` and `/auth/*` to backend via service discovery.
+  </Tab>
+  <Tab title="To VPC Endpoints">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "frontend_to_vpce" {
+      security_group_id            = aws_security_group.frontend.id
+      ip_protocol                  = "tcp"
+      from_port                    = 443
+      to_port                      = 443
+      referenced_security_group_id = aws_security_group.vpc_endpoint.id
+      description                  = "Frontend task runtime access to AWS API endpoints"
+    }
+    ```
+
+    **Purpose**: ECS agent needs ECR/CloudWatch/Secrets Manager access during task lifecycle.
+  </Tab>
+  <Tab title="DNS Resolution">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "frontend_dns_udp" {
+      security_group_id = aws_security_group.frontend.id
+      ip_protocol       = "udp"
+      from_port         = 53
+      to_port           = 53
+      cidr_ipv4         = var.vpc_cidr
+      description       = "DNS resolution in VPC"
+    }
+
+    resource "aws_vpc_security_group_egress_rule" "frontend_dns_tcp" {
+      security_group_id = aws_security_group.frontend.id
+      ip_protocol       = "tcp"
+      from_port         = 53
+      to_port           = 53
+      cidr_ipv4         = var.vpc_cidr
+      description       = "DNS resolution in VPC"
+    }
+    ```
+
+    **Purpose**: Service discovery, VPC endpoint resolution, RDS endpoint lookup.
+  </Tab>
+</Tabs>
+
+### Summary Table
+
+| Direction | Protocol | Port | Source/Destination | Description |
+|-----------|----------|------|-------------------|-------------|
+| Inbound | TCP | 80 | `sg-alb` | ALB traffic |
+| Outbound | TCP | 8080 | `sg-backend` | Call backend API |
+| Outbound | TCP | 443 | `sg-vpc-endpoint` | AWS services |
+| Outbound | TCP/UDP | 53 | VPC CIDR | DNS resolution |
+
+## Backend Security Group
+
+The backend security group protects Spring Boot application containers:
+
+```hcl
+resource "aws_security_group" "backend" {
+  name        = "${local.name_prefix}-backend-sg"
+  description = "Allow ingress to backend only from frontend tasks"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-backend-sg"
+  })
+}
+```
+
+### Ingress Rules
+
+Only frontend tasks can reach the backend:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "backend_from_frontend" {
+  security_group_id            = aws_security_group.backend.id
+  ip_protocol                  = "tcp"
+  from_port                    = var.backend_port
+  to_port                      = var.backend_port
+  referenced_security_group_id = aws_security_group.frontend.id
+  description                  = "Only frontend can reach backend"
+}
+```
+
+<Warning>
+**Critical Security Control**: Backend has NO public ingress. It cannot be accessed directly from the internet, even if someone discovers the private IP.
+</Warning>
+
+### Egress Rules
+
+<Tabs>
+  <Tab title="To Database">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "backend_to_db" {
+      security_group_id            = aws_security_group.backend.id
+      ip_protocol                  = "tcp"
+      from_port                    = var.db_port
+      to_port                      = var.db_port
+      referenced_security_group_id = aws_security_group.db.id
+      description                  = "Backend may reach database"
+    }
+    ```
+
+    **Purpose**: PostgreSQL connections from Spring Boot DataSource.
+  </Tab>
+  <Tab title="To VPC Endpoints">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "backend_to_vpce" {
+      security_group_id            = aws_security_group.backend.id
+      ip_protocol                  = "tcp"
+      from_port                    = 443
+      to_port                      = 443
+      referenced_security_group_id = aws_security_group.vpc_endpoint.id
+      description                  = "Backend task runtime access to AWS API endpoints"
+    }
+    ```
+
+    **Purpose**: Read secrets from Secrets Manager, write logs to CloudWatch.
+  </Tab>
+  <Tab title="DNS Resolution">
+    ```hcl
+    resource "aws_vpc_security_group_egress_rule" "backend_dns_udp" {
+      security_group_id = aws_security_group.backend.id
+      ip_protocol       = "udp"
+      from_port         = 53
+      to_port           = 53
+      cidr_ipv4         = var.vpc_cidr
+      description       = "DNS resolution in VPC"
+    }
+
+    resource "aws_vpc_security_group_egress_rule" "backend_dns_tcp" {
+      security_group_id = aws_security_group.backend.id
+      ip_protocol       = "tcp"
+      from_port         = 53
+      to_port           = 53
+      cidr_ipv4         = var.vpc_cidr
+      description       = "DNS resolution in VPC"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Summary Table
+
+| Direction | Protocol | Port | Source/Destination | Description |
+|-----------|----------|------|-------------------|-------------|
+| Inbound | TCP | 8080 | `sg-frontend` | Frontend requests |
+| Outbound | TCP | 5432 | `sg-db` | Database queries |
+| Outbound | TCP | 443 | `sg-vpc-endpoint` | AWS services |
+| Outbound | TCP/UDP | 53 | VPC CIDR | DNS resolution |
+
+## Database Security Group
+
+The database security group restricts PostgreSQL access:
+
+```hcl
+resource "aws_security_group" "db" {
+  name        = "${local.name_prefix}-db-sg"
+  description = "Allow database access only from backend tasks"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-db-sg"
+  })
+}
+```
+
+### Ingress Rules
+
+Only backend tasks can connect to the database:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "db_from_backend" {
+  security_group_id            = aws_security_group.db.id
+  ip_protocol                  = "tcp"
+  from_port                    = var.db_port
+  to_port                      = var.db_port
+  referenced_security_group_id = aws_security_group.backend.id
+  description                  = "Backend-only DB access"
+}
+```
+
+### Egress Rules
+
+```hcl
+resource "aws_vpc_security_group_egress_rule" "db_internal" {
+  security_group_id = aws_security_group.db.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = var.vpc_cidr
+  description       = "Allow DB response traffic inside VPC"
+}
+```
+
+<Info>
+**Design Note**: RDS needs to send response packets back to backend. Egress is restricted to VPC CIDR only.
+</Info>
+
+### Summary Table
+
+| Direction | Protocol | Port | Source/Destination | Description |
+|-----------|----------|------|-------------------|-------------|
+| Inbound | TCP | 5432 | `sg-backend` | PostgreSQL connections |
+| Outbound | All | All | VPC CIDR | Response traffic |
+
+## VPC Endpoint Security Group
+
+The VPC endpoint security group controls access to AWS services:
+
+```hcl
+resource "aws_security_group" "vpc_endpoint" {
+  name        = "${local.name_prefix}-vpce-sg"
+  description = "Restrict interface endpoint access to ECS tasks"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-vpce-sg"
+  })
+}
+```
+
+### Ingress Rules
+
+Both frontend and backend tasks can access VPC endpoints:
+
+```hcl
+resource "aws_vpc_security_group_ingress_rule" "vpce_from_frontend" {
+  security_group_id            = aws_security_group.vpc_endpoint.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+  referenced_security_group_id = aws_security_group.frontend.id
+  description                  = "Frontend to VPC endpoints"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "vpce_from_backend" {
+  security_group_id            = aws_security_group.vpc_endpoint.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+  referenced_security_group_id = aws_security_group.backend.id
+  description                  = "Backend to VPC endpoints"
+}
+```
+
+### Egress Rules
+
+```hcl
+resource "aws_vpc_security_group_egress_rule" "vpce_all" {
+  security_group_id = aws_security_group.vpc_endpoint.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "Endpoint-managed return traffic"
+}
+```
+
+### Summary Table
+
+| Direction | Protocol | Port | Source/Destination | Description |
+|-----------|----------|------|-------------------|-------------|
+| Inbound | TCP | 443 | `sg-frontend` | Frontend task API calls |
+| Inbound | TCP | 443 | `sg-backend` | Backend task API calls |
+| Outbound | All | All | `0.0.0.0/0` | AWS-managed responses |
+
+## Security Group Relationships
+
+Visual representation of security group references:
+
+```
+┌──────────┐
+│   sg-alb │
+└────┬─────┘
+     │ (port 80)
+     ▼
+┌──────────────┐
+│ sg-frontend  │
+└──────┬───────┘
+       │
+       ├── (port 8080) ──▶ ┌──────────────┐
+       │                   │  sg-backend  │
+       │                   └──────┬───────┘
+       │                          │ (port 5432)
+       │                          ▼
+       │                   ┌──────────────┐
+       │                   │    sg-db     │
+       │                   └──────────────┘
+       │
+       └── (port 443) ────▶ ┌──────────────┐
+                            │ sg-vpc-endpt │◀── (port 443) ── sg-backend
+                            └──────────────┘
+```
+
+## Security Best Practices
+
+### Implemented Controls
+
+<Accordion title="Least Privilege">
+  Each security group allows only the minimum required traffic:
+  
+  - ✅ No `0.0.0.0/0` egress rules (except VPC endpoints)
+  - ✅ No `0.0.0.0/0` ingress rules to private resources
+  - ✅ Security group references instead of CIDR blocks where possible
+  - ✅ Explicit ports (no port ranges like `1-65535`)
+</Accordion>
+
+<Accordion title="Defense in Depth">
+  Security is layered:
+  
+  1. **Network layer**: Private subnets with no internet route
+  2. **Security groups**: Explicit allow rules
+  3. **Application layer**: JWT authentication, CORS restrictions
+  4. **Data layer**: TLS-enforced connections, encrypted at rest
+</Accordion>
+
+<Accordion title="No Implicit Trust">
+  - Frontend cannot access database directly
+  - Backend cannot receive public internet traffic
+  - VPC endpoints restricted to specific security groups
+  - ALB cannot reach backend directly
+</Accordion>
+
+### Production Hardening
+
+For production deployments, consider:
+
+<Tabs>
+  <Tab title="IP Allowlisting">
+    Restrict ALB access to known networks:
+
+    ```hcl
+    alb_ingress_cidrs = [
+      "203.0.113.0/24",     # Corporate office
+      "198.51.100.0/24",    # VPN gateway
+      "192.0.2.50/32"       # DevOps bastion
+    ]
+    ```
+  </Tab>
+  <Tab title="VPC Flow Logs">
+    Enable VPC Flow Logs for security monitoring:
+
+    ```hcl
+    # Add to modules/network/main.tf
+    resource "aws_flow_log" "vpc" {
+      vpc_id          = aws_vpc.this.id
+      traffic_type    = "ALL"
+      iam_role_arn    = aws_iam_role.flow_logs.arn
+      log_destination = aws_cloudwatch_log_group.flow_logs.arn
+    }
+    ```
+  </Tab>
+  <Tab title="WAF Integration">
+    Add AWS WAF to ALB for application-layer protection:
+
+    ```hcl
+    resource "aws_wafv2_web_acl_association" "alb" {
+      resource_arn = aws_lb.frontend.arn
+      web_acl_arn  = aws_wafv2_web_acl.main.arn
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Troubleshooting
+
+### Common Issues
+
+<Accordion title="Backend task cannot connect to RDS">
+  **Symptoms**: Backend logs show connection timeout to database
+
+  **Check**:
+  1. Backend security group has egress rule to `sg-db` on port 5432
+  2. DB security group has ingress rule from `sg-backend` on port 5432
+  3. RDS is in same VPC and private subnets
+  4. Backend task is using correct `DB_HOST` environment variable
+
+  **Verify**:
+  ```bash
+  # Check security group rules
+  aws ec2 describe-security-group-rules \
+    --filters Name=group-id,Values=sg-xxxx
+  ```
+</Accordion>
+
+<Accordion title="ECS task fails to pull image">
+  **Symptoms**: Task stopped with "CannotPullContainerError"
+
+  **Check**:
+  1. Frontend/backend SG has egress to `sg-vpc-endpoint` on port 443
+  2. VPC endpoint SG has ingress from frontend/backend SG on port 443
+  3. VPC endpoints for `ecr.api`, `ecr.dkr`, and `s3` exist
+  4. Private DNS is enabled on ECR endpoints
+
+  **Verify**:
+  ```bash
+  # Check VPC endpoints
+  aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=vpc-xxxx
+  ```
+</Accordion>
+
+<Accordion title="ALB health checks failing">
+  **Symptoms**: ECS service shows unhealthy targets
+
+  **Check**:
+  1. ALB security group has egress to `sg-frontend` on port 80
+  2. Frontend security group has ingress from `sg-alb` on port 80
+  3. Target group health check path is correct (`/`)
+  4. Frontend container is listening on port 80
+
+  **Verify**:
+  ```bash
+  # Check target health
+  aws elbv2 describe-target-health \
+    --target-group-arn arn:aws:elasticloadbalancing:...
+  ```
+</Accordion>
+
+## Module Outputs
+
+The security module exposes these security group IDs:
+
+```hcl
+# modules/security/outputs.tf
+
+output "alb_sg_id" {
+  description = "ID of the ALB security group"
+  value       = aws_security_group.alb.id
+}
+
+output "frontend_sg_id" {
+  description = "ID of the frontend security group"
+  value       = aws_security_group.frontend.id
+}
+
+output "backend_sg_id" {
+  description = "ID of the backend security group"
+  value       = aws_security_group.backend.id
+}
+
+output "db_sg_id" {
+  description = "ID of the database security group"
+  value       = aws_security_group.db.id
+}
+
+output "vpc_endpoint_sg_id" {
+  description = "ID of the VPC endpoint security group"
+  value       = aws_security_group.vpc_endpoint.id
+}
+```

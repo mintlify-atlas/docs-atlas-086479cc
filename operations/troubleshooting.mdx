@@ -1,0 +1,881 @@
+---
+title: Troubleshooting Guide
+description: Common issues, debugging techniques, and resolution steps for ADMA Cloud infrastructure and applications
+---
+
+Diagnose and resolve issues with your ADMA URL shortener deployment using this comprehensive troubleshooting guide.
+
+## Application Issues
+
+### Backend Not Starting
+
+<Accordion title="Symptom: Tasks immediately stop after starting">
+**Check stopped task reason:**
+
+```bash
+# Get the most recent stopped task ID
+TASK_ID=$(aws ecs list-tasks \
+  --cluster adma-cluster \
+  --service-name adma-backend \
+  --desired-status STOPPED \
+  --max-items 1 \
+  --query 'taskArns[0]' \
+  --output text)
+
+# Describe the stopped task
+aws ecs describe-tasks \
+  --cluster adma-cluster \
+  --tasks $TASK_ID \
+  --query 'tasks[0].{StoppedReason:stoppedReason,Containers:containers[].{Name:name,Reason:reason,ExitCode:exitCode}}'
+```
+
+**Common causes:**
+
+1. **Missing secrets** - Check SSM Parameter Store
+   ```bash
+   aws ssm get-parameter --name /adma/prod/JWT_SECRET
+   aws ssm get-parameter --name /adma/prod/DB_PASSWORD
+   ```
+
+2. **Database connection failure**
+   - Verify RDS endpoint is correct in task definition
+   - Check security group allows backend → RDS connection
+   - Test connectivity from ECS task:
+     ```bash
+     aws ecs execute-command \
+       --cluster adma-cluster \
+       --task TASK_ID \
+       --container backend \
+       --interactive \
+       --command "/bin/sh"
+     # Inside container:
+     nc -zv $DB_HOST $DB_PORT
+     ```
+
+3. **Insufficient resources**
+   - Increase `cpu` and `memory` in task definition
+   - Check CloudWatch logs for OOM (Out of Memory) errors
+
+**View logs:**
+```bash
+aws logs tail /ecs/adma-prod-backend --follow --since 30m
+```
+</Accordion>
+
+### Frontend Not Accessible
+
+<Accordion title="Symptom: ALB returns 503 Service Unavailable">
+**Check target health:**
+
+```bash
+# Get target group ARN
+TARGET_GROUP=$(aws elbv2 describe-target-groups \
+  --names adma-prod-feg \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)
+
+# Check target health status
+aws elbv2 describe-target-health \
+  --target-group-arn $TARGET_GROUP
+```
+
+**Possible states:**
+
+| State | Description | Action |
+|-------|-------------|--------|
+| `initial` | Target is registering | Wait 30-60 seconds |
+| `healthy` | Target is serving traffic | No action needed |
+| `unhealthy` | Health checks failing | Check container logs |
+| `draining` | Target is deregistering | Wait for replacement task |
+| `unavailable` | Target is not registered | Check ECS service desired count |
+
+**Debug unhealthy targets:**
+
+1. Check container health check:
+   ```bash
+   aws ecs describe-tasks \
+     --cluster adma-cluster \
+     --tasks TASK_ID \
+     --query 'tasks[0].containers[0].healthStatus'
+   ```
+
+2. Test health endpoint manually:
+   ```bash
+   # Get task private IP
+   PRIVATE_IP=$(aws ecs describe-tasks \
+     --cluster adma-cluster \
+     --tasks TASK_ID \
+     --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' \
+     --output text)
+
+   # Test from bastion or another ECS task
+   curl -I http://$PRIVATE_IP:80/
+   ```
+
+3. Review frontend logs:
+   ```bash
+   aws logs tail /ecs/adma-prod-frontend --follow
+   ```
+</Accordion>
+
+### API Returns 500 Errors
+
+<Accordion title="Symptom: Backend endpoints return Internal Server Error">
+**View application logs:**
+
+```bash
+# Filter for ERROR level logs
+aws logs filter-log-events \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-pattern "ERROR" \
+  --start-time $(date -u -d '1 hour ago' +%s)000 \
+  --query 'events[*].[timestamp,message]' \
+  --output text
+```
+
+**Common issues:**
+
+1. **Database connection pool exhausted**
+   ```sql
+   -- Check active connections
+   SELECT count(*) FROM pg_stat_activity WHERE datname = 'urlshortener';
+   
+   -- Check max connections
+   SHOW max_connections;
+   ```
+   
+   **Solution**: Increase Hikari pool size in `application.yml`:
+   ```yaml
+   spring:
+     datasource:
+       hikari:
+         maximum-pool-size: 20  # Increase from 10
+   ```
+
+2. **JWT validation failures**
+   - Verify `JWT_SECRET` matches between environments
+   - Check token expiration (`JWT_EXPIRATION_MS`)
+   - Test token generation:
+     ```bash
+     curl -X POST https://api.yourdomain.com/api/auth/login \
+       -H "Content-Type: application/json" \
+       -d '{"email":"test@example.com","password":"password123"}'
+     ```
+
+3. **CORS errors**
+   - Check `CORS_ALLOWED_ORIGINS` includes frontend domain
+   - Verify ALB listener rules route correctly
+   - Test CORS preflight:
+     ```bash
+     curl -X OPTIONS https://api.yourdomain.com/api/urls \
+       -H "Origin: https://yourdomain.com" \
+       -H "Access-Control-Request-Method: POST" \
+       -v
+     ```
+</Accordion>
+
+## Database Issues
+
+### Connection Timeout
+
+<Accordion title="Symptom: Connection to RDS times out">
+**Check security groups:**
+
+```bash
+# Get RDS security group
+RDS_SG=$(aws rds describe-db-instances \
+  --db-instance-identifier adma-prod-postgres \
+  --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' \
+  --output text)
+
+# Check inbound rules
+aws ec2 describe-security-groups \
+  --group-ids $RDS_SG \
+  --query 'SecurityGroups[0].IpPermissions[?ToPort==`5432`]'
+```
+
+**Verify rule allows backend security group:**
+```json Expected Rule
+{
+  "FromPort": 5432,
+  "ToPort": 5432,
+  "IpProtocol": "tcp",
+  "UserIdGroupPairs": [
+    {
+      "GroupId": "sg-backend-xxxxx"
+    }
+  ]
+}
+```
+
+**Add missing rule:**
+```bash
+BACKEND_SG=$(aws ec2 describe-security-groups \
+  --filters "Name=tag:Name,Values=adma-prod-backend-sg" \
+  --query 'SecurityGroups[0].GroupId' \
+  --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG \
+  --protocol tcp \
+  --port 5432 \
+  --source-group $BACKEND_SG
+```
+</Accordion>
+
+### High Connection Count
+
+<Accordion title="Symptom: Database rejecting new connections">
+**Monitor connection metrics:**
+
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name DatabaseConnections \
+  --dimensions Name=DBInstanceIdentifier,Value=adma-prod-postgres \
+  --start-time $(date -u -d '1 hour ago' --iso-8601=seconds) \
+  --end-time $(date -u --iso-8601=seconds) \
+  --period 300 \
+  --statistics Maximum,Average
+```
+
+**Check max connections:**
+```bash
+# Connect to RDS
+psql -h adma-postgres.xxxxx.eu-west-1.rds.amazonaws.com \
+     -U appuser \
+     -d urlshortener
+
+-- Inside psql:
+SHOW max_connections;
+SELECT count(*) FROM pg_stat_activity;
+SELECT state, count(*) FROM pg_stat_activity GROUP BY state;
+```
+
+**Solutions:**
+
+1. **Increase RDS max_connections:**
+   ```bash
+   aws rds modify-db-parameter-group \
+     --db-parameter-group-name adma-prod-postgres-params \
+     --parameters "ParameterName=max_connections,ParameterValue=200,ApplyMethod=immediate"
+   ```
+
+2. **Reduce Hikari pool size per task:**
+   ```yaml application.yml
+   spring:
+     datasource:
+       hikari:
+         maximum-pool-size: 5  # Reduce from 10
+         minimum-idle: 2
+   ```
+
+3. **Scale down backend tasks** (if overprovisioned):
+   ```bash
+   aws ecs update-service \
+     --cluster adma-cluster \
+     --service adma-backend \
+     --desired-count 1
+   ```
+</Accordion>
+
+### Slow Query Performance
+
+<Accordion title="Symptom: API response times > 2 seconds">
+**Enable RDS Performance Insights:**
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-prod-postgres \
+  --enable-performance-insights \
+  --performance-insights-retention-period 7
+```
+
+**Check slow query logs:**
+
+```bash
+aws logs tail /aws/rds/instance/adma-prod-postgres/postgresql --follow
+```
+
+**Analyze query patterns:**
+```sql
+-- Enable pg_stat_statements extension
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Find slowest queries
+SELECT 
+  query,
+  calls,
+  total_exec_time,
+  mean_exec_time,
+  max_exec_time
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+```
+
+**Common optimizations:**
+
+1. Add indexes for frequent lookups:
+   ```sql
+   CREATE INDEX idx_short_urls_short_code ON short_urls(short_code);
+   CREATE INDEX idx_short_urls_user_status ON short_urls(user_id, link_status);
+   ```
+
+2. Upgrade RDS instance class:
+   ```bash
+   aws rds modify-db-instance \
+     --db-instance-identifier adma-prod-postgres \
+     --db-instance-class db.t3.small \
+     --apply-immediately
+   ```
+</Accordion>
+
+## Networking Issues
+
+### ALB Not Routing Correctly
+
+<Accordion title="Symptom: API calls return 404 or route to wrong service">
+**Check listener rules:**
+
+```bash
+# Get ALB ARN
+ALB_ARN=$(aws elbv2 describe-load-balancers \
+  --names adma-prod-alb \
+  --query 'LoadBalancers[0].LoadBalancerArn' \
+  --output text)
+
+# List listeners
+aws elbv2 describe-listeners \
+  --load-balancer-arn $ALB_ARN
+
+# Get HTTPS listener ARN (port 443)
+LISTENER_ARN=$(aws elbv2 describe-listeners \
+  --load-balancer-arn $ALB_ARN \
+  --query 'Listeners[?Port==`443`].ListenerArn' \
+  --output text)
+
+# Check rules
+aws elbv2 describe-rules \
+  --listener-arn $LISTENER_ARN \
+  --query 'Rules[*].{Priority:Priority,Conditions:Conditions,Actions:Actions}'
+```
+
+**Expected rules:**
+
+1. **Priority 10**: `/api/*` → backend target group
+2. **Priority 20**: `/{shortcode}` → backend target group
+3. **Default**: `/*` → frontend target group
+
+**Fix missing rule:**
+```bash
+BACKEND_TG=$(aws elbv2 describe-target-groups \
+  --names adma-prod-backend-tg \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)
+
+aws elbv2 create-rule \
+  --listener-arn $LISTENER_ARN \
+  --priority 10 \
+  --conditions '[{"Field":"path-pattern","Values":["/api/*"]}]' \
+  --actions Type=forward,TargetGroupArn=$BACKEND_TG
+```
+</Accordion>
+
+### HTTPS Certificate Issues
+
+<Accordion title="Symptom: Browser shows SSL/TLS errors">
+**Check ACM certificate status:**
+
+```bash
+aws acm list-certificates --region eu-west-1
+
+# Describe specific certificate
+aws acm describe-certificate \
+  --certificate-arn arn:aws:acm:eu-west-1:ACCOUNT:certificate/xxxxx \
+  --query 'Certificate.{Domain:DomainName,Status:Status,InUse:InUseBy}'
+```
+
+**Validate certificate is attached to listener:**
+```bash
+aws elbv2 describe-listeners \
+  --listener-arns $LISTENER_ARN \
+  --query 'Listeners[0].Certificates[0].CertificateArn'
+```
+
+**Reissue certificate if expired:**
+```bash
+aws acm request-certificate \
+  --domain-name yourdomain.com \
+  --subject-alternative-names "*.yourdomain.com" \
+  --validation-method DNS \
+  --region eu-west-1
+```
+
+**Update listener with new certificate:**
+```bash
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --certificates CertificateArn=arn:aws:acm:...
+```
+</Accordion>
+
+### DNS Resolution Failures
+
+<Accordion title="Symptom: Frontend cannot resolve backend hostname">
+**Check Service Discovery:**
+
+```bash
+# Get private DNS namespace
+aws servicediscovery list-namespaces \
+  --filters Name=TYPE,Values=DNS_PRIVATE
+
+# Check backend service registration
+aws servicediscovery list-services
+
+# Test DNS resolution from frontend container
+aws ecs execute-command \
+  --cluster adma-cluster \
+  --task FRONTEND_TASK_ID \
+  --container frontend \
+  --interactive \
+  --command "/bin/sh"
+
+# Inside container:
+nslookup backend.adma.local
+wget -O- http://backend.adma.local:8080/actuator/health
+```
+
+**Verify environment variable:**
+```bash
+aws ecs describe-task-definition \
+  --task-definition adma-prod-frontend:latest \
+  --query 'taskDefinition.containerDefinitions[0].environment[?name==`BACKEND_UPSTREAM`]'
+```
+
+**Expected value:**
+```json
+{
+  "name": "BACKEND_UPSTREAM",
+  "value": "backend.adma.local:8080"
+}
+```
+</Accordion>
+
+## Deployment Issues
+
+### Task Won't Reach Steady State
+
+<Accordion title="Symptom: Deployment stuck in progress">
+**Check service events:**
+
+```bash
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].events[:10]'
+```
+
+**Common messages:**
+
+| Event Message | Cause | Solution |
+|---------------|-------|----------|
+| `service ... has reached a steady state` | Deployment successful | None |
+| `(service ...) was unable to place a task` | Resource constraints | Check subnet IPs, service quotas |
+| `(service ...) failed to launch a task with (error ECS was unable to assume the role)` | IAM permissions | Fix task execution role |
+| `(service ...) has started 2 tasks: (task abc123)` | Tasks starting | Wait or check task logs |
+
+**Force rollback if stuck:**
+```bash
+# Get previous stable task definition revision
+PREVIOUS_REV=$(aws ecs list-task-definitions \
+  --family-prefix adma-backend \
+  --status ACTIVE \
+  --sort DESC \
+  --max-items 2 \
+  --query 'taskDefinitionArns[1]' \
+  --output text)
+
+# Update service to previous revision
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --task-definition $PREVIOUS_REV \
+  --force-new-deployment
+```
+</Accordion>
+
+### Circuit Breaker Triggered
+
+<Accordion title="Symptom: Deployment automatically rolls back">
+**View deployment circuit breaker events:**
+
+```bash
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].deployments[*].{Status:status,RolloutState:rolloutState,FailedTasks:failedTasks}'
+```
+
+**Investigate failed tasks:**
+```bash
+# Get failed task IDs from deployment
+FAILED_TASKS=$(aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].deployments[0].failedTasks' \
+  --output text)
+
+# Describe failed tasks
+for TASK in $FAILED_TASKS; do
+  aws ecs describe-tasks \
+    --cluster adma-cluster \
+    --tasks $TASK \
+    --query 'tasks[0].{StoppedReason:stoppedReason,Containers:containers[*].reason}'
+done
+```
+
+**Common causes:**
+
+1. **Health check failures** - Adjust `startPeriod` in task definition
+2. **Container crashes** - Check application logs
+3. **Resource constraints** - Increase task CPU/memory
+
+**Disable circuit breaker temporarily:**
+```bash
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --deployment-configuration \
+    "deploymentCircuitBreaker={enable=false}"
+```
+
+<Warning>
+Only disable circuit breaker for debugging. Re-enable after identifying root cause.
+</Warning>
+</Accordion>
+
+### Image Pull Errors
+
+<Accordion title="Symptom: CannotPullContainerError">
+**Check ECR repository permissions:**
+
+```bash
+# Verify image exists
+aws ecr describe-images \
+  --repository-name adma/backend \
+  --image-ids imageTag=latest
+
+# Check repository policy
+aws ecr get-repository-policy \
+  --repository-name adma/backend
+```
+
+**Verify task execution role has ECR permissions:**
+```bash
+aws iam get-role \
+  --role-name ecsTaskExecutionRole \
+  --query 'Role.RoleName'
+
+aws iam list-attached-role-policies \
+  --role-name ecsTaskExecutionRole
+```
+
+**Attach missing ECR policy:**
+```bash
+aws iam attach-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+```
+
+**Test image pull manually:**
+```bash
+aws ecr get-login-password --region eu-west-1 \
+  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com
+
+docker pull ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:latest
+```
+</Accordion>
+
+## Scaling Issues
+
+### Auto Scaling Not Triggering
+
+<Accordion title="Symptom: Service stays at min capacity despite high load">
+**Check scaling policies:**
+
+```bash
+# List scaling policies
+aws application-autoscaling describe-scaling-policies \
+  --service-namespace ecs \
+  --resource-id service/adma-cluster/adma-backend
+
+# Check scaling alarms
+aws cloudwatch describe-alarms \
+  --alarm-name-prefix adma-prod-backend
+```
+
+**Verify metrics are publishing:**
+```bash
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ECS \
+  --metric-name CPUUtilization \
+  --dimensions Name=ServiceName,Value=adma-prod-backend Name=ClusterName,Value=adma-prod-ecs \
+  --start-time $(date -u -d '1 hour ago' --iso-8601=seconds) \
+  --end-time $(date -u --iso-8601=seconds) \
+  --period 60 \
+  --statistics Average
+```
+
+**Manually test scaling:**
+```bash
+# Scale up
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --desired-count 3
+
+# Check if tasks start successfully
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].{Running:runningCount,Desired:desiredCount}'
+```
+
+**Adjust target values if needed:**
+```bash
+aws application-autoscaling put-scaling-policy \
+  --service-namespace ecs \
+  --resource-id service/adma-cluster/adma-backend \
+  --scalable-dimension ecs:service:DesiredCount \
+  --policy-name adma-backend-cpu \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-scaling-policy-configuration file://scaling-policy.json
+```
+</Accordion>
+
+## Scheduled Tasks Not Running
+
+<Accordion title="Symptom: Cleanup job not executing">
+**Check scheduled task configuration:**
+
+The cleanup job runs inside the backend container via Spring's `@Scheduled` annotation:
+
+```java ExpiredUrlCleanupService.java
+@Scheduled(cron = "0 */15 * * * *")  // Every 15 minutes
+public void cleanupExpiredUrls() {
+  // ...
+}
+```
+
+**Verify backend is running:**
+```bash
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].{Running:runningCount,Desired:desiredCount}'
+```
+
+**Search logs for cleanup execution:**
+```bash
+aws logs filter-log-events \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-pattern "ExpiredUrlCleanupService" \
+  --start-time $(date -u -d '1 hour ago' +%s)000
+```
+
+**Expected log output:**
+```
+2026-03-04 10:15:00.123 INFO  ExpiredUrlCleanupService - Starting cleanup of expired URLs
+2026-03-04 10:15:00.456 INFO  ExpiredUrlCleanupService - Marked 5 expired URLs as EXPIRED
+2026-03-04 10:15:00.789 INFO  ExpiredUrlCleanupService - Deleted 3 EXPIRED and DELETED URLs
+```
+
+<Warning>
+If you scale backend beyond `desired_count = 1`, the job will run on every task simultaneously. Use ShedLock or migrate to ECS Scheduled Tasks to prevent duplicate execution.
+</Warning>
+</Accordion>
+
+## Quick Diagnostics Commands
+
+Run these commands for a quick health check:
+
+```bash Quick Health Check
+#!/bin/bash
+
+CLUSTER="adma-cluster"
+REGION="eu-west-1"
+
+echo "=== ECS Services ==="
+aws ecs describe-services \
+  --cluster $CLUSTER \
+  --services adma-backend adma-frontend \
+  --query 'services[*].{Name:serviceName,Running:runningCount,Desired:desiredCount,Status:status}' \
+  --output table
+
+echo "\n=== ALB Target Health ==="
+for TG in $(aws elbv2 describe-target-groups --query 'TargetGroups[*].TargetGroupArn' --output text); do
+  aws elbv2 describe-target-health --target-group-arn $TG --query 'TargetHealthDescriptions[*].{Target:Target.Id,Port:Target.Port,Health:TargetHealth.State}' --output table
+done
+
+echo "\n=== RDS Status ==="
+aws rds describe-db-instances \
+  --db-instance-identifier adma-prod-postgres \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,Endpoint:Endpoint.Address,Connections:PendingModifiedValues}' \
+  --output table
+
+echo "\n=== Recent Errors ==="
+aws logs filter-log-events \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-pattern "ERROR" \
+  --start-time $(date -u -d '10 minutes ago' +%s)000 \
+  --query 'events[*].[timestamp,message]' \
+  --output text | head -10
+
+echo "\n=== Service Events ==="
+aws ecs describe-services \
+  --cluster $CLUSTER \
+  --services adma-backend \
+  --query 'services[0].events[:5]' \
+  --output table
+```
+
+Save as `health-check.sh` and run:
+```bash
+chmod +x health-check.sh
+./health-check.sh
+```
+
+## Rollback Procedures
+
+### Emergency Rollback Steps
+
+<Steps>
+  <Step title="Identify last stable version">
+    ```bash
+    git log --oneline -10
+    # Note the commit SHA of the last known good deployment
+    ```
+  </Step>
+
+  <Step title="Find task definition revision">
+    ```bash
+    aws ecs list-task-definitions \
+      --family-prefix adma-backend \
+      --status ACTIVE \
+      --sort DESC \
+      --max-items 5
+    ```
+  </Step>
+
+  <Step title="Update service to previous revision">
+    ```bash
+    aws ecs update-service \
+      --cluster adma-cluster \
+      --service adma-backend \
+      --task-definition adma-backend:12 \
+      --force-new-deployment
+    ```
+  </Step>
+
+  <Step title="Monitor rollback progress">
+    ```bash
+    aws ecs describe-services \
+      --cluster adma-cluster \
+      --services adma-backend \
+      --query 'services[0].deployments[*].{Status:status,TaskDef:taskDefinition,Running:runningCount}'
+    ```
+  </Step>
+
+  <Step title="Verify application health">
+    ```bash
+    curl https://api.yourdomain.com/actuator/health
+    curl https://api.yourdomain.com/api/stats
+    ```
+  </Step>
+</Steps>
+
+### Rollback Using Specific Image Tag
+
+<Steps>
+  <Step title="Update task definition JSON">
+    Edit `infrastructure/task-def-backend.json`:
+    ```json
+    "image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:a1b2c3d"
+    ```
+  </Step>
+
+  <Step title="Register new task definition">
+    ```bash
+    aws ecs register-task-definition \
+      --cli-input-json file://infrastructure/task-def-backend.json
+    ```
+  </Step>
+
+  <Step title="Deploy">
+    ```bash
+    NEW_REV=$(aws ecs describe-task-definition \
+      --task-definition adma-backend \
+      --query 'taskDefinition.revision' \
+      --output text)
+
+    aws ecs update-service \
+      --cluster adma-cluster \
+      --service adma-backend \
+      --task-definition adma-backend:$NEW_REV \
+      --force-new-deployment
+    ```
+  </Step>
+</Steps>
+
+## Getting Help
+
+If you're still experiencing issues:
+
+1. **Check AWS Service Health**: https://status.aws.amazon.com/
+2. **Review CloudWatch Logs**: Look for stack traces and error patterns
+3. **Enable ECS Exec**: Connect directly to containers for debugging
+4. **Contact Support**: AWS Support Console or your team's operations channel
+
+### Enabling ECS Exec for Debugging
+
+```bash
+# Enable ECS Exec on service
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --enable-execute-command
+
+# Connect to running task
+TASK_ID=$(aws ecs list-tasks \
+  --cluster adma-cluster \
+  --service-name adma-backend \
+  --desired-status RUNNING \
+  --query 'taskArns[0]' \
+  --output text | awk -F/ '{print $NF}')
+
+aws ecs execute-command \
+  --cluster adma-cluster \
+  --task $TASK_ID \
+  --container backend \
+  --interactive \
+  --command "/bin/bash"
+```
+
+<Tip>
+ECS Exec requires Session Manager plugin:
+```bash
+# macOS
+brew install --cask session-manager-plugin
+
+# Linux
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+sudo dpkg -i session-manager-plugin.deb
+```
+</Tip>
+
+## Next Steps
+
+- Review [monitoring setup](/operations/monitoring) to catch issues proactively
+- Configure [automated alerts](/operations/monitoring#creating-cloudwatch-alarms) for critical metrics
+- Document your team's incident response procedures

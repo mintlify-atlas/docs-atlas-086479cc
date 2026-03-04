@@ -1,0 +1,387 @@
+---
+title: RDS PostgreSQL Database Setup
+description: Create and configure an Amazon RDS PostgreSQL instance for the ADMA application
+---
+
+The ADMA URL Shortener uses PostgreSQL 16 as its primary database, hosted on Amazon RDS for managed, scalable, and reliable data storage.
+
+## Database Architecture
+
+The RDS instance is deployed in a **private subnet** with no public internet access. Only the backend ECS tasks can connect to it through security group rules.
+
+### Security Model
+
+- RDS resides in private subnets across multiple availability zones
+- No public IP address assigned
+- Access restricted to backend security group only
+- Credentials stored in AWS Systems Manager Parameter Store
+- Encrypted at rest and in transit
+
+## Create DB Subnet Group
+
+RDS requires a DB subnet group that spans at least two availability zones.
+
+```bash
+aws rds create-db-subnet-group \
+  --db-subnet-group-name adma-rds-subnet-group \
+  --db-subnet-group-description "ADMA RDS subnet group for private subnets" \
+  --subnet-ids subnet-AAAAAAAA subnet-BBBBBBBB \
+  --region $AWS_REGION
+```
+
+<Warning>
+Replace `subnet-AAAAAAAA` and `subnet-BBBBBBBB` with your actual **private subnet IDs**. These must be in different availability zones.
+</Warning>
+
+## Create RDS Security Group
+
+Create a security group that allows PostgreSQL connections only from the backend:
+
+```bash
+# Get your VPC ID
+VPC_ID=$(aws ec2 describe-vpcs \
+  --filters "Name=isDefault,Values=false" \
+  --query 'Vpcs[0].VpcId' \
+  --output text \
+  --region $AWS_REGION)
+
+# Create security group
+RDS_SG=$(aws ec2 create-security-group \
+  --group-name adma-rds-sg \
+  --description "Security group for ADMA RDS PostgreSQL" \
+  --vpc-id $VPC_ID \
+  --region $AWS_REGION \
+  --query 'GroupId' \
+  --output text)
+
+echo "RDS Security Group: $RDS_SG"
+```
+
+<Info>
+We'll add the ingress rule after creating the backend security group, since they need to reference each other.
+</Info>
+
+## Create RDS Instance
+
+<Steps>
+
+### Generate a Secure Password
+
+Create a strong password for the database master user:
+
+```bash
+export DB_PASSWORD=$(openssl rand -base64 32)
+echo "Save this password: $DB_PASSWORD"
+```
+
+<Warning>
+**Important**: Save this password securely. You'll need it to configure the backend application.
+</Warning>
+
+### Create the Database Instance
+
+```bash
+aws rds create-db-instance \
+  --db-instance-identifier adma-postgres \
+  --db-instance-class db.t3.micro \
+  --engine postgres \
+  --engine-version "16.3" \
+  --master-username appuser \
+  --master-user-password "$DB_PASSWORD" \
+  --db-name urlshortener \
+  --db-subnet-group-name adma-rds-subnet-group \
+  --vpc-security-group-ids $RDS_SG \
+  --no-publicly-accessible \
+  --storage-type gp3 \
+  --allocated-storage 20 \
+  --backup-retention-period 7 \
+  --deletion-protection \
+  --region $AWS_REGION
+```
+
+### Configuration Parameters Explained
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `db-instance-identifier` | `adma-postgres` | Unique identifier for the RDS instance |
+| `db-instance-class` | `db.t3.micro` | Instance type (1 vCPU, 1 GB RAM) - free tier eligible |
+| `engine-version` | `16.3` | PostgreSQL version |
+| `master-username` | `appuser` | Database administrator username |
+| `db-name` | `urlshortener` | Initial database name |
+| `no-publicly-accessible` | - | Ensures no public IP (private only) |
+| `storage-type` | `gp3` | Latest generation SSD storage |
+| `allocated-storage` | `20` | 20 GB initial storage |
+| `backup-retention-period` | `7` | Keep daily backups for 7 days |
+| `deletion-protection` | - | Prevents accidental deletion |
+
+<Info>
+For production workloads, consider:
+- `db.t3.small` or larger instance class
+- Multi-AZ deployment with `--multi-az` flag
+- Higher storage allocation
+- Longer backup retention period
+</Info>
+
+### Monitor Creation Progress
+
+RDS instance creation takes approximately 5-10 minutes:
+
+```bash
+aws rds describe-db-instances \
+  --db-instance-identifier adma-postgres \
+  --query 'DBInstances[0].DBInstanceStatus' \
+  --output text \
+  --region $AWS_REGION
+```
+
+Wait until the status shows `available`.
+
+### Get the Database Endpoint
+
+Once available, retrieve the connection endpoint:
+
+```bash
+DB_ENDPOINT=$(aws rds describe-db-instances \
+  --db-instance-identifier adma-postgres \
+  --query 'DBInstances[0].Endpoint.Address' \
+  --output text \
+  --region $AWS_REGION)
+
+echo "Database Endpoint: $DB_ENDPOINT"
+# Example: adma-postgres.xxxxxxxx.eu-west-1.rds.amazonaws.com
+```
+
+</Steps>
+
+## Store Database Credentials in SSM
+
+**Never** hardcode database passwords in your application code or task definitions. Use AWS Systems Manager Parameter Store:
+
+```bash
+# Store the database password
+aws ssm put-parameter \
+  --name "/adma/prod/DB_PASSWORD" \
+  --value "$DB_PASSWORD" \
+  --type SecureString \
+  --region $AWS_REGION
+
+# Store the database endpoint
+aws ssm put-parameter \
+  --name "/adma/prod/DB_HOST" \
+  --value "$DB_ENDPOINT" \
+  --type String \
+  --region $AWS_REGION
+```
+
+<Info>
+`SecureString` parameters are encrypted using AWS KMS. They can only be decrypted by services with the appropriate IAM permissions.
+</Info>
+
+Verify the parameters:
+
+```bash
+aws ssm get-parameter \
+  --name "/adma/prod/DB_HOST" \
+  --region $AWS_REGION
+```
+
+## Initialize the Database Schema
+
+The Spring Boot backend uses Hibernate to automatically create the database schema. However, ShedLock (used for distributed job locking) requires manual table creation.
+
+### Create ShedLock Table
+
+Connect to your RDS instance and create the ShedLock table:
+
+```sql
+CREATE TABLE IF NOT EXISTS shedlock (
+    name       VARCHAR(64)  NOT NULL,
+    lock_until TIMESTAMP    NOT NULL,
+    locked_at  TIMESTAMP    NOT NULL,
+    locked_by  VARCHAR(255) NOT NULL,
+    PRIMARY KEY (name)
+);
+```
+
+<Note>
+**ShedLock** ensures that scheduled tasks (like the expired URL cleanup job) run on only one instance when your backend scales horizontally.
+</Note>
+
+### Connection Methods
+
+<CodeGroup>
+
+```bash Bastion Host
+# Connect through an EC2 bastion host in a public subnet
+ssh -i your-key.pem ec2-user@bastion-ip
+psql -h $DB_ENDPOINT -U appuser -d urlshortener
+```
+
+```bash SSM Session Manager
+# Connect through AWS Systems Manager Session Manager (no SSH key needed)
+aws ssm start-session --target instance-id
+psql -h $DB_ENDPOINT -U appuser -d urlshortener
+```
+
+```bash VPN/Direct Connect
+# If you have VPN or Direct Connect to your VPC
+psql -h $DB_ENDPOINT -U appuser -d urlshortener
+```
+
+</CodeGroup>
+
+## Security Group Configuration
+
+Configure the RDS security group to accept connections only from the backend:
+
+```bash
+# This command will be run after creating the backend security group
+# Placeholder for now - we'll update this in the ECS setup
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG \
+  --protocol tcp \
+  --port 5432 \
+  --source-group sg-BACKEND-SG-ID \
+  --region $AWS_REGION
+```
+
+<Warning>
+Do **not** allow ingress from `0.0.0.0/0` (all IPs). This would expose your database to the public internet.
+</Warning>
+
+## Monitoring and Maintenance
+
+### Enable Enhanced Monitoring
+
+For detailed performance metrics, enable enhanced monitoring:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-postgres \
+  --monitoring-interval 60 \
+  --monitoring-role-arn arn:aws:iam::$ACCOUNT_ID:role/rds-monitoring-role \
+  --region $AWS_REGION
+```
+
+### Automated Backups
+
+RDS automatically creates daily backups during the backup window. To modify the backup window:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-postgres \
+  --preferred-backup-window "03:00-04:00" \
+  --region $AWS_REGION
+```
+
+### Performance Insights
+
+Enable Performance Insights for query-level monitoring:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-postgres \
+  --enable-performance-insights \
+  --performance-insights-retention-period 7 \
+  --region $AWS_REGION
+```
+
+## Database Configuration Reference
+
+### Environment Variables for Backend
+
+The backend application requires these environment variables (configured in the ECS task definition):
+
+| Variable | Value | Source |
+|----------|-------|--------|
+| `DB_HOST` | `adma-postgres.xxxxx.region.rds.amazonaws.com` | RDS endpoint |
+| `DB_PORT` | `5432` | Default PostgreSQL port |
+| `DB_NAME` | `urlshortener` | Database name |
+| `DB_USERNAME` | `appuser` | Master username |
+| `DB_PASSWORD` | (secret) | SSM Parameter Store |
+
+### Connection Pool Settings
+
+The Spring Boot backend uses HikariCP with these default settings:
+
+```yaml application.yml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+```
+
+## Troubleshooting
+
+### Cannot Connect to RDS
+
+**Problem**: Connection timeout when connecting to RDS
+
+**Solutions**:
+1. Verify the instance is in `available` status
+2. Check security group rules allow inbound traffic on port 5432
+3. Ensure you're connecting from a resource within the VPC
+4. Verify the DB subnet group uses private subnets
+
+### Authentication Failed
+
+**Problem**: `password authentication failed for user "appuser"`
+
+**Solutions**:
+1. Verify the password stored in SSM Parameter Store
+2. Check for special characters that might need escaping
+3. Reset the master password if necessary:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-postgres \
+  --master-user-password "NEW_PASSWORD" \
+  --region $AWS_REGION
+```
+
+### Database Disk Full
+
+**Problem**: Storage is full
+
+**Solution**: Increase allocated storage:
+
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier adma-postgres \
+  --allocated-storage 50 \
+  --region $AWS_REGION
+```
+
+<Info>
+RDS supports storage autoscaling. Enable it to automatically increase storage when needed.
+</Info>
+
+## Cost Optimization
+
+### Free Tier Eligibility
+
+The `db.t3.micro` instance with 20 GB of storage is eligible for the AWS free tier:
+- 750 hours per month of db.t3.micro usage
+- 20 GB of General Purpose (SSD) storage
+- 20 GB of backup storage
+
+### Production Considerations
+
+For production workloads:
+- Use Multi-AZ deployment for high availability (doubles the cost)
+- Consider Reserved Instances for 1-3 year commitments (up to 69% savings)
+- Enable storage autoscaling to avoid manual intervention
+- Use Amazon RDS Proxy for connection pooling at scale
+
+## Next Steps
+
+With your RDS database configured:
+
+1. [Set up ECS Fargate](/deployment/ecs-fargate) - Create task definitions and services
+2. [Configure Load Balancer](/deployment/load-balancer) - Set up application routing
+3. [Enable HTTPS/SSL](/deployment/https-ssl) - Secure your application

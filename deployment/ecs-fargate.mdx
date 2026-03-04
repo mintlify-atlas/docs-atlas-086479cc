@@ -1,0 +1,520 @@
+---
+title: ECS Fargate Deployment
+description: Create ECS cluster, task definitions, and services to run ADMA containers on AWS Fargate
+---
+
+AWS ECS (Elastic Container Service) with Fargate allows you to run Docker containers without managing servers. This guide covers creating the cluster, task definitions, and services for the ADMA application.
+
+## ECS Architecture Overview
+
+The ADMA deployment uses two ECS services:
+
+- **Backend Service**: Spring Boot API (port 8080)
+- **Frontend Service**: Nginx static site (port 80)
+
+Both services run in **private subnets** and are accessed through the Application Load Balancer.
+
+## Create ECS Cluster
+
+Create a Fargate-only cluster:
+
+```bash
+aws ecs create-cluster \
+  --cluster-name adma-cluster \
+  --capacity-providers FARGATE FARGATE_SPOT \
+  --region $AWS_REGION
+```
+
+<Info>
+**FARGATE_SPOT** can reduce costs by up to 70% but may interrupt tasks. Use it for non-critical workloads or in combination with regular Fargate.
+</Info>
+
+Verify the cluster:
+
+```bash
+aws ecs describe-clusters \
+  --clusters adma-cluster \
+  --region $AWS_REGION
+```
+
+## Create IAM Roles for ECS
+
+ECS tasks require two IAM roles:
+
+### Task Execution Role
+
+This role allows ECS to pull images from ECR, write logs to CloudWatch, and read secrets from SSM.
+
+<Steps>
+
+### Create the Trust Policy
+
+```bash
+cat > /tmp/ecs-trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+
+### Create the Role
+
+```bash
+aws iam create-role \
+  --role-name ecsTaskExecutionRole \
+  --assume-role-policy-document file:///tmp/ecs-trust-policy.json
+```
+
+### Attach Managed Policies
+
+```bash
+# Allow ECS to pull from ECR and write to CloudWatch
+aws iam attach-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+```
+
+### Add SSM Parameter Access
+
+Create an inline policy to read secrets:
+
+```bash
+cat > /tmp/ssm-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameters",
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:$AWS_REGION:$ACCOUNT_ID:parameter/adma/prod/*"
+      ]
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-name SSMParameterAccess \
+  --policy-document file:///tmp/ssm-policy.json
+```
+
+</Steps>
+
+### Task Role (Optional)
+
+The task role grants permissions to the application code itself (e.g., to access S3, DynamoDB). For ADMA, this is optional.
+
+```bash
+aws iam create-role \
+  --role-name ecsTaskRole \
+  --assume-role-policy-document file:///tmp/ecs-trust-policy.json
+```
+
+## Create Security Groups
+
+Create security groups for the backend and frontend services:
+
+<CodeGroup>
+
+```bash Backend Security Group
+# Create backend security group
+BACKEND_SG=$(aws ec2 create-security-group \
+  --group-name adma-backend-sg \
+  --description "Security group for ADMA backend ECS tasks" \
+  --vpc-id $VPC_ID \
+  --region $AWS_REGION \
+  --query 'GroupId' \
+  --output text)
+
+echo "Backend SG: $BACKEND_SG"
+
+# Allow inbound from ALB (will be configured after ALB creation)
+# Placeholder for: aws ec2 authorize-security-group-ingress...
+
+# Allow outbound to RDS
+aws ec2 authorize-security-group-egress \
+  --group-id $BACKEND_SG \
+  --protocol tcp \
+  --port 5432 \
+  --source-group $RDS_SG \
+  --region $AWS_REGION
+
+# Allow outbound HTTPS (for SSM, CloudWatch)
+aws ec2 authorize-security-group-egress \
+  --group-id $BACKEND_SG \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0 \
+  --region $AWS_REGION
+```
+
+```bash Frontend Security Group
+# Create frontend security group
+FRONTEND_SG=$(aws ec2 create-security-group \
+  --group-name adma-frontend-sg \
+  --description "Security group for ADMA frontend ECS tasks" \
+  --vpc-id $VPC_ID \
+  --region $AWS_REGION \
+  --query 'GroupId' \
+  --output text)
+
+echo "Frontend SG: $FRONTEND_SG"
+
+# Allow inbound from ALB (will be configured after ALB creation)
+# Placeholder for: aws ec2 authorize-security-group-ingress...
+
+# Allow outbound HTTPS (for CloudWatch logs)
+aws ec2 authorize-security-group-egress \
+  --group-id $FRONTEND_SG \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0 \
+  --region $AWS_REGION
+```
+
+</CodeGroup>
+
+## Create CloudWatch Log Groups
+
+Create log groups for container logs:
+
+```bash
+# Backend logs
+aws logs create-log-group \
+  --log-group-name /ecs/adma-backend \
+  --region $AWS_REGION
+
+# Frontend logs
+aws logs create-log-group \
+  --log-group-name /ecs/adma-frontend \
+  --region $AWS_REGION
+```
+
+Set retention policy (optional):
+
+```bash
+# Retain logs for 7 days
+aws logs put-retention-policy \
+  --log-group-name /ecs/adma-backend \
+  --retention-in-days 7 \
+  --region $AWS_REGION
+
+aws logs put-retention-policy \
+  --log-group-name /ecs/adma-frontend \
+  --retention-in-days 7 \
+  --region $AWS_REGION
+```
+
+## Register Task Definitions
+
+### Backend Task Definition
+
+The backend task definition includes environment variables and secrets configuration.
+
+<Steps>
+
+### Edit the Task Definition
+
+Open `infrastructure/task-def-backend.json` from your repository and replace placeholders:
+
+| Placeholder | Replace With |
+|-------------|-------------|
+| `ACCOUNT_ID` | Your AWS account ID (appears 3 times) |
+| `adma-postgres.xxxxx.region.rds.amazonaws.com` | Your RDS endpoint |
+| `https://go.yourdomain.com` | Your production domain for short URLs |
+| `https://yourdomain.com` | Your frontend domain (for CORS) |
+
+### Task Definition Structure
+
+```json infrastructure/task-def-backend.json
+{
+  "family": "adma-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "hostPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "DB_HOST", "value": "adma-postgres.xxxxx.eu-west-1.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_NAME", "value": "urlshortener" },
+        { "name": "DB_USERNAME", "value": "appuser" },
+        { "name": "APP_BASE_URL", "value": "https://go.yourdomain.com" },
+        { "name": "CORS_ALLOWED_ORIGINS", "value": "https://yourdomain.com" },
+        { "name": "SERVER_PORT", "value": "8080" },
+        { "name": "JWT_EXPIRATION_MS", "value": "86400000" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT_ID:parameter/adma/prod/DB_PASSWORD"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT_ID:parameter/adma/prod/JWT_SECRET"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/adma-backend",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "backend"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/actuator/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
+```
+
+### Register the Task Definition
+
+```bash
+aws ecs register-task-definition \
+  --cli-input-json file://infrastructure/task-def-backend.json \
+  --region $AWS_REGION
+```
+
+</Steps>
+
+### Frontend Task Definition
+
+The frontend task definition is simpler since it only serves static files:
+
+<Steps>
+
+### Edit the Task Definition
+
+Open `infrastructure/task-def-frontend.json` and replace `ACCOUNT_ID` with your AWS account ID.
+
+### Task Definition Structure
+
+```json infrastructure/task-def-frontend.json
+{
+  "family": "adma-frontend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "frontend",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/adma/frontend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "hostPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/adma-frontend",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "frontend"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 10
+      }
+    }
+  ]
+}
+```
+
+### Register the Task Definition
+
+```bash
+aws ecs register-task-definition \
+  --cli-input-json file://infrastructure/task-def-frontend.json \
+  --region $AWS_REGION
+```
+
+</Steps>
+
+## Resource Allocation Guide
+
+### CPU and Memory Units
+
+Fargate tasks use specific CPU/memory combinations:
+
+| vCPU | Memory Options (MB) |
+|------|--------------------|
+| 0.25 | 512, 1024, 2048 |
+| 0.5  | 1024 - 4096 (1 GB increments) |
+| 1    | 2048 - 8192 (1 GB increments) |
+| 2    | 4096 - 16384 (1 GB increments) |
+| 4    | 8192 - 30720 (1 GB increments) |
+
+### Recommended Configurations
+
+<CodeGroup>
+
+```yaml Development/Testing
+backend:
+  cpu: "512"    # 0.5 vCPU
+  memory: "1024" # 1 GB
+
+frontend:
+  cpu: "256"    # 0.25 vCPU
+  memory: "512"  # 512 MB
+```
+
+```yaml Production
+backend:
+  cpu: "1024"   # 1 vCPU
+  memory: "2048" # 2 GB
+
+frontend:
+  cpu: "512"    # 0.5 vCPU
+  memory: "1024" # 1 GB
+```
+
+```yaml High Traffic
+backend:
+  cpu: "2048"   # 2 vCPU
+  memory: "4096" # 4 GB
+
+frontend:
+  cpu: "1024"   # 1 vCPU
+  memory: "2048" # 2 GB
+```
+
+</CodeGroup>
+
+## Environment Variables Reference
+
+### Backend Environment Variables
+
+| Variable | Type | Example | Description |
+|----------|------|---------|-------------|
+| `DB_HOST` | Plain | `adma-postgres.xxx.rds.amazonaws.com` | RDS endpoint |
+| `DB_PORT` | Plain | `5432` | PostgreSQL port |
+| `DB_NAME` | Plain | `urlshortener` | Database name |
+| `DB_USERNAME` | Plain | `appuser` | Database user |
+| `DB_PASSWORD` | Secret | (SSM) | Database password from SSM |
+| `JWT_SECRET` | Secret | (SSM) | JWT signing key from SSM |
+| `JWT_EXPIRATION_MS` | Plain | `86400000` | Token expiration (24 hours) |
+| `APP_BASE_URL` | Plain | `https://go.example.com` | Base URL for short links |
+| `CORS_ALLOWED_ORIGINS` | Plain | `https://example.com` | Allowed CORS origins |
+| `SERVER_PORT` | Plain | `8080` | Backend port |
+
+<Warning>
+**Never** hardcode secrets in the `environment` array. Always use the `secrets` array with SSM Parameter Store ARNs.
+</Warning>
+
+## Container Health Checks
+
+Health checks determine when a container is ready to receive traffic:
+
+### Backend Health Check
+
+```json
+{
+  "command": [
+    "CMD-SHELL",
+    "curl -f http://localhost:8080/actuator/health || exit 1"
+  ],
+  "interval": 30,      // Check every 30 seconds
+  "timeout": 10,       // Fail if no response in 10 seconds
+  "retries": 3,        // Mark unhealthy after 3 failures
+  "startPeriod": 60    // Wait 60 seconds before first check
+}
+```
+
+<Info>
+Spring Boot Actuator provides the `/actuator/health` endpoint automatically. It checks database connectivity and application status.
+</Info>
+
+### Frontend Health Check
+
+```json
+{
+  "command": ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"],
+  "interval": 30,
+  "timeout": 5,
+  "retries": 3,
+  "startPeriod": 10
+}
+```
+
+## Logging Configuration
+
+Logs are sent to CloudWatch Logs using the `awslogs` driver:
+
+```json
+{
+  "logDriver": "awslogs",
+  "options": {
+    "awslogs-group": "/ecs/adma-backend",
+    "awslogs-region": "eu-west-1",
+    "awslogs-stream-prefix": "backend"
+  }
+}
+```
+
+View logs in real-time:
+
+```bash
+# Backend logs
+aws logs tail /ecs/adma-backend --follow --region $AWS_REGION
+
+# Frontend logs
+aws logs tail /ecs/adma-frontend --follow --region $AWS_REGION
+```
+
+## Next Steps
+
+With task definitions registered:
+
+1. [Configure Load Balancer](/deployment/load-balancer) - Set up ALB and routing
+2. Create ECS services (covered after ALB setup)
+3. [Enable HTTPS/SSL](/deployment/https-ssl) - Secure with certificates
+
+<Note>
+ECS services require the ALB and target groups to exist first. We'll create the services after setting up the load balancer.
+</Note>

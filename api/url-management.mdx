@@ -1,0 +1,572 @@
+---
+title: URL Management
+description: Create, list, delete, and sync shortened URLs
+---
+
+The URL management endpoints allow both authenticated and anonymous users to create and manage shortened URLs. Authenticated users can create permanent links, while anonymous users create temporary links with an 8-hour expiration.
+
+## Create Short URL (Authenticated)
+
+Create a permanent shortened URL associated with your account.
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:8080/api/urls \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -d '{
+    "originalUrl": "https://example.com/very-long-url"
+  }'
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/urls', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer YOUR_JWT_TOKEN',
+  },
+  body: JSON.stringify({
+    originalUrl: 'https://example.com/very-long-url',
+  }),
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+headers = {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN'
+}
+
+response = requests.post(
+    'http://localhost:8080/api/urls',
+    json={'originalUrl': 'https://example.com/very-long-url'},
+    headers=headers
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+POST /api/urls
+```
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/api/auth/login` or `/api/auth/register`.
+  
+  Format: `Bearer <token>`
+</ParamField>
+
+### Request Body
+
+<ParamField body="originalUrl" type="string" required>
+  The long URL to shorten. Must start with `http://`, `https://`, or `ftp://`. Maximum 2048 characters.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="integer">
+  Unique identifier for this short URL.
+</ResponseField>
+
+<ResponseField name="originalUrl" type="string">
+  The original long URL.
+</ResponseField>
+
+<ResponseField name="shortCode" type="string">
+  The generated 7-character alphanumeric code (e.g., `aB3xYz7`).
+</ResponseField>
+
+<ResponseField name="shortUrl" type="string">
+  Fully-qualified short URL ready to share (e.g., `https://short.ly/aB3xYz7`).
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO 8601 timestamp of creation.
+</ResponseField>
+
+<ResponseField name="expiresAt" type="string | null">
+  Expiration timestamp. `null` for permanent (authenticated) links.
+</ResponseField>
+
+<ResponseField name="linkType" type="string">
+  Either `TEMPORARY` or `PERMANENT`.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current status: `ACTIVE`, `EXPIRED`, or `DELETED`.
+</ResponseField>
+
+<ResponseField name="redirectCount" type="integer">
+  Total number of times this link has been followed.
+</ResponseField>
+
+<ResponseField name="avgRedirectMs" type="number | null">
+  Running average redirect latency in milliseconds. `null` until first redirect.
+</ResponseField>
+
+<ResponseField name="destinationStatus" type="integer | null">
+  Last HTTP status code of the destination URL. `null` until first availability check.
+</ResponseField>
+
+<ResponseField name="lastCheckedAt" type="string | null">
+  When the destination was last checked for availability.
+</ResponseField>
+
+### Status Codes
+
+<ResponseField name="201 Created" type="Success">
+  Short URL successfully created.
+</ResponseField>
+
+<ResponseField name="400 Bad Request" type="Error">
+  Invalid URL format or validation error.
+</ResponseField>
+
+<ResponseField name="401 Unauthorized" type="Error">
+  Missing or invalid JWT token.
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "id": 42,
+  "originalUrl": "https://example.com/very-long-url",
+  "shortCode": "aB3xYz7",
+  "shortUrl": "https://short.ly/aB3xYz7",
+  "createdAt": "2024-03-15T10:30:00Z",
+  "expiresAt": null,
+  "linkType": "PERMANENT",
+  "status": "ACTIVE",
+  "redirectCount": 0,
+  "avgRedirectMs": null,
+  "destinationStatus": null,
+  "lastCheckedAt": null
+}
+```
+
+---
+
+## Create Short URL (Anonymous)
+
+Create a temporary shortened URL without authentication. The link expires after 8 hours.
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:8080/api/urls/public \
+  -H "Content-Type: application/json" \
+  -d '{
+    "originalUrl": "https://example.com/temporary-link"
+  }'
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/urls/public', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    originalUrl: 'https://example.com/temporary-link',
+  }),
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+response = requests.post(
+    'http://localhost:8080/api/urls/public',
+    json={'originalUrl': 'https://example.com/temporary-link'}
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+POST /api/urls/public
+```
+
+### Request Body
+
+<ParamField body="originalUrl" type="string" required>
+  The long URL to shorten. Must start with `http://`, `https://`, or `ftp://`. Maximum 2048 characters.
+</ParamField>
+
+### Response
+
+Same as authenticated endpoint, but `expiresAt` will be set to 8 hours from creation, and `linkType` will be `TEMPORARY`.
+
+### Status Codes
+
+<ResponseField name="201 Created" type="Success">
+  Short URL successfully created.
+</ResponseField>
+
+<ResponseField name="400 Bad Request" type="Error">
+  Invalid URL format or validation error.
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "id": 43,
+  "originalUrl": "https://example.com/temporary-link",
+  "shortCode": "xY9pQw2",
+  "shortUrl": "https://short.ly/xY9pQw2",
+  "createdAt": "2024-03-15T10:30:00Z",
+  "expiresAt": "2024-03-15T18:30:00Z",
+  "linkType": "TEMPORARY",
+  "status": "ACTIVE",
+  "redirectCount": 0,
+  "avgRedirectMs": null,
+  "destinationStatus": null,
+  "lastCheckedAt": null
+}
+```
+
+---
+
+## List My URLs
+
+Retrieve all shortened URLs owned by the authenticated user, sorted by newest first.
+
+<CodeGroup>
+```bash cURL
+curl -X GET http://localhost:8080/api/urls \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/urls', {
+  method: 'GET',
+  headers: {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN',
+  },
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+headers = {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN'
+}
+
+response = requests.get(
+    'http://localhost:8080/api/urls',
+    headers=headers
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+GET /api/urls
+```
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/api/auth/login` or `/api/auth/register`.
+</ParamField>
+
+### Response
+
+Array of short URL objects (same structure as create response).
+
+### Status Codes
+
+<ResponseField name="200 OK" type="Success">
+  Returns list of user's URLs.
+</ResponseField>
+
+<ResponseField name="401 Unauthorized" type="Error">
+  Missing or invalid JWT token.
+</ResponseField>
+
+### Example Response
+
+```json
+[
+  {
+    "id": 42,
+    "originalUrl": "https://example.com/page1",
+    "shortCode": "aB3xYz7",
+    "shortUrl": "https://short.ly/aB3xYz7",
+    "createdAt": "2024-03-15T10:30:00Z",
+    "expiresAt": null,
+    "linkType": "PERMANENT",
+    "status": "ACTIVE",
+    "redirectCount": 125,
+    "avgRedirectMs": 42.3,
+    "destinationStatus": 200,
+    "lastCheckedAt": "2024-03-15T12:00:00Z"
+  },
+  {
+    "id": 41,
+    "originalUrl": "https://example.com/page2",
+    "shortCode": "xY9pQw2",
+    "shortUrl": "https://short.ly/xY9pQw2",
+    "createdAt": "2024-03-15T09:15:00Z",
+    "expiresAt": null,
+    "linkType": "PERMANENT",
+    "status": "ACTIVE",
+    "redirectCount": 87,
+    "avgRedirectMs": 38.7,
+    "destinationStatus": 200,
+    "lastCheckedAt": "2024-03-15T11:45:00Z"
+  }
+]
+```
+
+---
+
+## Delete Short URL
+
+Soft-delete a shortened URL. The link will be marked as `DELETED` and will no longer redirect.
+
+<CodeGroup>
+```bash cURL
+curl -X DELETE http://localhost:8080/api/urls/42 \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/urls/42', {
+  method: 'DELETE',
+  headers: {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN',
+  },
+});
+```
+
+```python Python
+import requests
+
+headers = {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN'
+}
+
+response = requests.delete(
+    'http://localhost:8080/api/urls/42',
+    headers=headers
+)
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+DELETE /api/urls/{id}
+```
+
+### Path Parameters
+
+<ParamField path="id" type="integer" required>
+  The unique identifier of the short URL to delete.
+</ParamField>
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/api/auth/login` or `/api/auth/register`.
+</ParamField>
+
+### Response
+
+No response body.
+
+### Status Codes
+
+<ResponseField name="204 No Content" type="Success">
+  Short URL successfully deleted.
+</ResponseField>
+
+<ResponseField name="401 Unauthorized" type="Error">
+  Missing or invalid JWT token, or attempting to delete another user's URL.
+</ResponseField>
+
+<ResponseField name="404 Not Found" type="Error">
+  Short URL with the specified ID not found.
+</ResponseField>
+
+---
+
+## Sync Anonymous URLs
+
+Bulk-sync anonymous URLs from localStorage to the authenticated user's account. This endpoint is called after registration or login to convert temporary links to permanent ones.
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:8080/api/urls/sync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -d '{
+    "urls": [
+      "https://example.com/page1",
+      "https://example.com/page2",
+      "https://example.com/page3"
+    ]
+  }'
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/urls/sync', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer YOUR_JWT_TOKEN',
+  },
+  body: JSON.stringify({
+    urls: [
+      'https://example.com/page1',
+      'https://example.com/page2',
+      'https://example.com/page3',
+    ],
+  }),
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+headers = {
+    'Authorization': 'Bearer YOUR_JWT_TOKEN'
+}
+
+response = requests.post(
+    'http://localhost:8080/api/urls/sync',
+    json={
+        'urls': [
+            'https://example.com/page1',
+            'https://example.com/page2',
+            'https://example.com/page3'
+        ]
+    },
+    headers=headers
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+POST /api/urls/sync
+```
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/api/auth/login` or `/api/auth/register`.
+</ParamField>
+
+### Request Body
+
+<ParamField body="urls" type="array" required>
+  List of original URLs to sync. Maximum 100 URLs per request. Duplicates (URLs already owned by the user) are silently skipped.
+</ParamField>
+
+### Response
+
+Returns the user's complete updated URL list after syncing (same structure as `GET /api/urls`).
+
+### Status Codes
+
+<ResponseField name="200 OK" type="Success">
+  URLs successfully synced. Returns updated list of all user URLs.
+</ResponseField>
+
+<ResponseField name="400 Bad Request" type="Error">
+  Invalid request (empty array, more than 100 URLs).
+  
+  <Expandable title="Example Error Response">
+    ```json
+    {
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Validation failed",
+      "timestamp": "2024-03-15T10:30:00Z",
+      "fieldErrors": {
+        "urls": "Cannot sync more than 100 URLs at once"
+      }
+    }
+    ```
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="401 Unauthorized" type="Error">
+  Missing or invalid JWT token.
+</ResponseField>
+
+### Example Response
+
+```json
+[
+  {
+    "id": 42,
+    "originalUrl": "https://example.com/page1",
+    "shortCode": "aB3xYz7",
+    "shortUrl": "https://short.ly/aB3xYz7",
+    "createdAt": "2024-03-15T10:30:00Z",
+    "expiresAt": null,
+    "linkType": "PERMANENT",
+    "status": "ACTIVE",
+    "redirectCount": 5,
+    "avgRedirectMs": 45.2,
+    "destinationStatus": null,
+    "lastCheckedAt": null
+  }
+]
+```
+
+## Business Rules
+
+<Note>
+  **Anonymous vs Authenticated Links**
+  
+  - **Anonymous links** (`POST /api/urls/public`):
+    - Expire after **8 hours**
+    - `linkType`: `TEMPORARY`
+    - Stored in browser localStorage
+    - Automatically synced upon login/registration
+  
+  - **Authenticated links** (`POST /api/urls`):
+    - **Never expire** (`expiresAt`: `null`)
+    - `linkType`: `PERMANENT`
+    - Associated with user account
+    - Can be listed and deleted
+</Note>
+
+<Warning>
+  **URL Validation**
+  
+  All URLs must:
+  - Start with `http://`, `https://`, or `ftp://`
+  - Be at most 2048 characters long
+  - Be properly formatted according to RFC 3986
+</Warning>

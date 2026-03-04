@@ -1,0 +1,524 @@
+---
+title: Application Load Balancer Setup
+description: Configure AWS Application Load Balancer with target groups and routing rules for ADMA
+---
+
+The Application Load Balancer (ALB) serves as the single entry point for all traffic to the ADMA application, routing requests to the appropriate backend or frontend services.
+
+## ALB Architecture
+
+The ALB handles:
+
+- **HTTP to HTTPS redirection** on port 80
+- **SSL/TLS termination** on port 443
+- **Path-based routing** to frontend and backend services
+- **Health checks** for both services
+- **Sticky sessions** (optional for stateful applications)
+
+### Routing Strategy
+
+| Path Pattern | Target Service | Port | Example |
+|--------------|----------------|------|----------|
+| `/api/*` | Backend | 8080 | `/api/urls`, `/api/auth/login` |
+| `/{shortCode}` | Backend | 8080 | `/abc1234` (7-char codes) |
+| `/*` (default) | Frontend | 80 | `/`, `/dashboard`, `/login` |
+
+## Create the Application Load Balancer
+
+<Steps>
+
+### Get Public Subnet IDs
+
+The ALB must be in **public subnets** to accept internet traffic:
+
+```bash
+# List subnets in your VPC
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[?MapPublicIpOnLaunch==`true`].[SubnetId,AvailabilityZone]' \
+  --output table \
+  --region $AWS_REGION
+```
+
+Select **two subnets in different availability zones**:
+
+```bash
+export SUBNET_PUBLIC_A="subnet-XXXXXXXX"
+export SUBNET_PUBLIC_B="subnet-YYYYYYYY"
+```
+
+### Create ALB Security Group
+
+Create a security group that allows inbound HTTP and HTTPS traffic:
+
+```bash
+ALB_SG=$(aws ec2 create-security-group \
+  --group-name adma-alb-sg \
+  --description "Security group for ADMA Application Load Balancer" \
+  --vpc-id $VPC_ID \
+  --region $AWS_REGION \
+  --query 'GroupId' \
+  --output text)
+
+echo "ALB Security Group: $ALB_SG"
+
+# Allow HTTP (port 80) from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id $ALB_SG \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0 \
+  --region $AWS_REGION
+
+# Allow HTTPS (port 443) from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id $ALB_SG \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0 \
+  --region $AWS_REGION
+```
+
+### Create the Load Balancer
+
+```bash
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name adma-alb \
+  --subnets $SUBNET_PUBLIC_A $SUBNET_PUBLIC_B \
+  --security-groups $ALB_SG \
+  --scheme internet-facing \
+  --type application \
+  --ip-address-type ipv4 \
+  --region $AWS_REGION \
+  --query 'LoadBalancers[0].LoadBalancerArn' \
+  --output text)
+
+echo "ALB ARN: $ALB_ARN"
+```
+
+### Get ALB DNS Name
+
+The ALB DNS name is your application's public endpoint:
+
+```bash
+ALB_DNS=$(aws elbv2 describe-load-balancers \
+  --load-balancer-arns $ALB_ARN \
+  --query 'LoadBalancers[0].DNSName' \
+  --output text \
+  --region $AWS_REGION)
+
+echo "ALB DNS: $ALB_DNS"
+# Example: adma-alb-123456789.eu-west-1.elb.amazonaws.com
+```
+
+</Steps>
+
+## Create Target Groups
+
+Target groups define how the ALB routes traffic to your ECS services.
+
+### Frontend Target Group
+
+```bash
+FRONTEND_TG_ARN=$(aws elbv2 create-target-group \
+  --name adma-frontend-tg \
+  --protocol HTTP \
+  --port 80 \
+  --vpc-id $VPC_ID \
+  --target-type ip \
+  --health-check-enabled \
+  --health-check-path "/" \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3 \
+  --matcher HttpCode=200 \
+  --region $AWS_REGION \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)
+
+echo "Frontend Target Group ARN: $FRONTEND_TG_ARN"
+```
+
+### Backend Target Group
+
+```bash
+BACKEND_TG_ARN=$(aws elbv2 create-target-group \
+  --name adma-backend-tg \
+  --protocol HTTP \
+  --port 8080 \
+  --vpc-id $VPC_ID \
+  --target-type ip \
+  --health-check-enabled \
+  --health-check-path "/actuator/health" \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 10 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3 \
+  --matcher HttpCode=200 \
+  --region $AWS_REGION \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)
+
+echo "Backend Target Group ARN: $BACKEND_TG_ARN"
+```
+
+<Info>
+**Target Type `ip`**: ECS Fargate with `awsvpc` network mode requires IP-based target groups. ECS automatically registers and deregisters task IPs.
+</Info>
+
+### Configure Deregistration Delay
+
+Reduce the deregistration delay for faster deployments:
+
+```bash
+# Frontend - quick deregistration (static files)
+aws elbv2 modify-target-group-attributes \
+  --target-group-arn $FRONTEND_TG_ARN \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30 \
+  --region $AWS_REGION
+
+# Backend - allow in-flight requests to complete
+aws elbv2 modify-target-group-attributes \
+  --target-group-arn $BACKEND_TG_ARN \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=60 \
+  --region $AWS_REGION
+```
+
+## Configure Security Group Rules
+
+Update ECS security groups to allow traffic from the ALB:
+
+```bash
+# Allow ALB to reach backend on port 8080
+aws ec2 authorize-security-group-ingress \
+  --group-id $BACKEND_SG \
+  --protocol tcp \
+  --port 8080 \
+  --source-group $ALB_SG \
+  --region $AWS_REGION
+
+# Allow ALB to reach frontend on port 80
+aws ec2 authorize-security-group-ingress \
+  --group-id $FRONTEND_SG \
+  --protocol tcp \
+  --port 80 \
+  --source-group $ALB_SG \
+  --region $AWS_REGION
+
+# Allow backend to reach RDS on port 5432
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG \
+  --protocol tcp \
+  --port 5432 \
+  --source-group $BACKEND_SG \
+  --region $AWS_REGION
+```
+
+## Create Listeners and Routing Rules
+
+### HTTP Listener (Port 80) - Redirect to HTTPS
+
+```bash
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}" \
+  --region $AWS_REGION
+```
+
+<Note>
+This creates a permanent redirect (301) from HTTP to HTTPS. All traffic will be encrypted.
+</Note>
+
+### HTTPS Listener (Port 443) - Main Application Traffic
+
+<Warning>
+Before creating the HTTPS listener, you need an SSL/TLS certificate from AWS Certificate Manager. See [HTTPS/SSL Setup](/deployment/https-ssl) first, or create the listener without HTTPS temporarily.
+</Warning>
+
+#### Option 1: With ACM Certificate (Recommended)
+
+```bash
+# After obtaining ACM certificate
+CERT_ARN="arn:aws:acm:$AWS_REGION:$ACCOUNT_ID:certificate/CERTIFICATE_ID"
+
+LISTENER_ARN=$(aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS-1-2-2017-01 \
+  --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN \
+  --region $AWS_REGION \
+  --query 'Listeners[0].ListenerArn' \
+  --output text)
+
+echo "HTTPS Listener ARN: $LISTENER_ARN"
+```
+
+#### Option 2: Temporary HTTP Listener for Testing
+
+For testing without HTTPS:
+
+```bash
+LISTENER_ARN=$(aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN \
+  --region $AWS_REGION \
+  --query 'Listeners[0].ListenerArn' \
+  --output text)
+```
+
+### Add Routing Rules
+
+Create rules to route API and shortcode requests to the backend:
+
+<Steps>
+
+### Rule 1: Route /api/* to Backend
+
+```bash
+aws elbv2 create-rule \
+  --listener-arn $LISTENER_ARN \
+  --priority 10 \
+  --conditions Field=path-pattern,Values="/api/*" \
+  --actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN \
+  --region $AWS_REGION
+```
+
+### Rule 2: Route Short Codes to Backend
+
+Short codes are 7 alphanumeric characters. We use path patterns to match them:
+
+```bash
+aws elbv2 create-rule \
+  --listener-arn $LISTENER_ARN \
+  --priority 20 \
+  --conditions Field=path-pattern,Values="/???????" \
+  --actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN \
+  --region $AWS_REGION
+```
+
+<Info>
+Each `?` matches exactly one character. `/???????` matches 7-character short codes like `/abc1234`.
+</Info>
+
+### Rule 3: Default - Route Everything Else to Frontend
+
+The default action (configured when creating the listener) already forwards to the frontend target group. This catches all other routes like `/`, `/login`, `/dashboard`.
+
+</Steps>
+
+## Create ECS Services
+
+Now that the ALB and target groups exist, create the ECS services:
+
+### Backend Service
+
+```bash
+aws ecs create-service \
+  --cluster adma-cluster \
+  --service-name adma-backend \
+  --task-definition adma-backend:1 \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --platform-version LATEST \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[$SUBNET_PRIVATE_A,$SUBNET_PRIVATE_B],
+    securityGroups=[$BACKEND_SG],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers "
+    targetGroupArn=$BACKEND_TG_ARN,
+    containerName=backend,
+    containerPort=8080" \
+  --health-check-grace-period-seconds 60 \
+  --region $AWS_REGION
+```
+
+<Warning>
+**Important**: Replace `$SUBNET_PRIVATE_A` and `$SUBNET_PRIVATE_B` with your **private subnet IDs**. ECS tasks should **not** be in public subnets.
+</Warning>
+
+### Frontend Service
+
+```bash
+aws ecs create-service \
+  --cluster adma-cluster \
+  --service-name adma-frontend \
+  --task-definition adma-frontend:1 \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --platform-version LATEST \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[$SUBNET_PRIVATE_A,$SUBNET_PRIVATE_B],
+    securityGroups=[$FRONTEND_SG],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers "
+    targetGroupArn=$FRONTEND_TG_ARN,
+    containerName=frontend,
+    containerPort=80" \
+  --health-check-grace-period-seconds 30 \
+  --region $AWS_REGION
+```
+
+### Service Parameters Explained
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `desired-count` | `2` | Number of tasks to run (high availability) |
+| `launch-type` | `FARGATE` | Serverless container execution |
+| `assignPublicIp` | `DISABLED` | Tasks in private subnets (accessed via ALB) |
+| `health-check-grace-period-seconds` | `60` | Time before first health check |
+
+<Info>
+**Backend Scaling**: The backend uses ShedLock for distributed job coordination. You can safely scale to 2+ instances without duplicate scheduled task execution.
+</Info>
+
+## Verify Deployment
+
+<Steps>
+
+### Check Service Status
+
+```bash
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend adma-frontend \
+  --query 'services[].[serviceName,status,runningCount,desiredCount]' \
+  --output table \
+  --region $AWS_REGION
+```
+
+Expected output:
+```
+-----------------------------------------
+|           DescribeServices           |
++----------------+---------+----+-------+
+|  adma-backend  | ACTIVE  | 2  |   2   |
+|  adma-frontend | ACTIVE  | 2  |   2   |
++----------------+---------+----+-------+
+```
+
+### Check Target Health
+
+```bash
+# Backend targets
+aws elbv2 describe-target-health \
+  --target-group-arn $BACKEND_TG_ARN \
+  --region $AWS_REGION
+
+# Frontend targets
+aws elbv2 describe-target-health \
+  --target-group-arn $FRONTEND_TG_ARN \
+  --region $AWS_REGION
+```
+
+All targets should show `healthy` state.
+
+### Test the Application
+
+```bash
+# Test backend API
+curl http://$ALB_DNS/api/stats
+
+# Test frontend
+curl -I http://$ALB_DNS/
+```
+
+</Steps>
+
+## Monitoring and Troubleshooting
+
+### View ALB Access Logs
+
+Enable access logs to S3 for debugging:
+
+```bash
+# Create S3 bucket for logs
+LOG_BUCKET="adma-alb-logs-$ACCOUNT_ID"
+aws s3 mb s3://$LOG_BUCKET --region $AWS_REGION
+
+# Enable access logging
+aws elbv2 modify-load-balancer-attributes \
+  --load-balancer-arn $ALB_ARN \
+  --attributes \
+    Key=access_logs.s3.enabled,Value=true \
+    Key=access_logs.s3.bucket,Value=$LOG_BUCKET \
+  --region $AWS_REGION
+```
+
+### Common Issues
+
+#### Targets Show "Unhealthy"
+
+**Causes**:
+1. Security group doesn't allow ALB traffic
+2. Container health check failing
+3. Wrong health check path
+
+**Solution**:
+```bash
+# Check security group rules
+aws ec2 describe-security-groups --group-ids $BACKEND_SG
+
+# Check container logs
+aws logs tail /ecs/adma-backend --follow --region $AWS_REGION
+```
+
+#### 503 Service Unavailable
+
+**Cause**: No healthy targets in the target group
+
+**Solution**: Check ECS service events and task logs:
+```bash
+aws ecs describe-services \
+  --cluster adma-cluster \
+  --services adma-backend \
+  --query 'services[0].events[0:5]' \
+  --region $AWS_REGION
+```
+
+#### Connection Timeout
+
+**Cause**: Network configuration issue (subnets, NAT gateway, route tables)
+
+**Solution**: Verify private subnets have routes to a NAT Gateway for outbound internet access (required for ECR image pulls and SSM parameter access).
+
+## Performance Optimization
+
+### Enable Connection Draining
+
+Already configured via `deregistration_delay`. Ensures in-flight requests complete before stopping old tasks.
+
+### Enable Sticky Sessions (Optional)
+
+If your application requires session affinity:
+
+```bash
+aws elbv2 modify-target-group-attributes \
+  --target-group-arn $BACKEND_TG_ARN \
+  --attributes \
+    Key=stickiness.enabled,Value=true \
+    Key=stickiness.type,Value=lb_cookie \
+    Key=stickiness.lb_cookie.duration_seconds,Value=86400 \
+  --region $AWS_REGION
+```
+
+<Note>
+ADMA uses JWT tokens for authentication, so sticky sessions are **not required**. The application is stateless.
+</Note>
+
+## Next Steps
+
+With the load balancer configured:
+
+1. [Enable HTTPS/SSL](/deployment/https-ssl) - Request ACM certificate and secure your ALB
+2. Configure Route 53 DNS to point to the ALB
+3. Set up Auto Scaling for the ECS services
+4. Enable CloudWatch alarms for monitoring

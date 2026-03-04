@@ -1,0 +1,375 @@
+---
+title: ECR Repositories and Docker Images
+description: Create ECR repositories, build Docker images, and push them to AWS Elastic Container Registry
+---
+
+Amazon Elastic Container Registry (ECR) stores your Docker images for the ADMA application. You need to create repositories for both the frontend and backend, then build and push the images.
+
+## Create ECR Repositories
+
+<Steps>
+
+### Set Environment Variables
+
+Ensure your environment variables are set from the [AWS Setup](/deployment/aws-setup) guide:
+
+```bash
+export AWS_REGION="eu-west-1"
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export ECR_BASE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+```
+
+### Create Backend Repository
+
+Create the ECR repository for the Spring Boot backend:
+
+```bash
+aws ecr create-repository \
+  --repository-name adma/backend \
+  --region $AWS_REGION \
+  --image-scanning-configuration scanOnPush=true
+```
+
+<Info>
+The `scanOnPush=true` flag enables automatic vulnerability scanning when images are pushed.
+</Info>
+
+### Create Frontend Repository
+
+Create the ECR repository for the React frontend:
+
+```bash
+aws ecr create-repository \
+  --repository-name adma/frontend \
+  --region $AWS_REGION \
+  --image-scanning-configuration scanOnPush=true
+```
+
+### Verify Repositories
+
+List your ECR repositories to confirm creation:
+
+```bash
+aws ecr describe-repositories --region $AWS_REGION
+```
+
+Expected output:
+```json
+{
+    "repositories": [
+        {
+            "repositoryName": "adma/backend",
+            "repositoryUri": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/backend",
+            "registryId": "123456789012"
+        },
+        {
+            "repositoryName": "adma/frontend",
+            "repositoryUri": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/frontend",
+            "registryId": "123456789012"
+        }
+    ]
+}
+```
+
+</Steps>
+
+## Authenticate Docker to ECR
+
+Before pushing images, authenticate your Docker client with ECR:
+
+```bash
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin $ECR_BASE
+```
+
+Expected output:
+```
+Login Succeeded
+```
+
+<Warning>
+The ECR authentication token expires after **12 hours**. If you see authentication errors, re-run this command.
+</Warning>
+
+## Build and Push Backend Image
+
+The backend uses a multi-stage Dockerfile that builds the Spring Boot application and packages it into a lightweight JRE container.
+
+<Steps>
+
+### Navigate to Backend Directory
+
+```bash
+cd /path/to/adma-sa2-sa3/backend
+```
+
+### Build Backend Image
+
+Build the Docker image with proper tags:
+
+```bash
+docker build \
+  -t $ECR_BASE/adma/backend:latest \
+  -t $ECR_BASE/adma/backend:$(git rev-parse --short HEAD) \
+  .
+```
+
+<Info>
+**Tagging Strategy**: We use both `latest` and the Git commit SHA. This allows easy rollbacks to specific versions.
+</Info>
+
+The build process:
+1. Uses `gradle:8.5-jdk21` to compile the Spring Boot application
+2. Creates an optimized JAR file
+3. Packages it into `eclipse-temurin:21-jre-alpine` for a minimal runtime image
+
+### Push Backend Image
+
+Push both tags to ECR:
+
+```bash
+docker push $ECR_BASE/adma/backend:latest
+docker push $ECR_BASE/adma/backend:$(git rev-parse --short HEAD)
+```
+
+### Verify Backend Image
+
+List images in the backend repository:
+
+```bash
+aws ecr describe-images \
+  --repository-name adma/backend \
+  --region $AWS_REGION
+```
+
+</Steps>
+
+## Build and Push Frontend Image
+
+The frontend build process is more complex because it requires the backend API URL at **build time**.
+
+<Warning>
+**Critical**: `VITE_API_BASE_URL` is baked into the JavaScript bundle during the Docker build. If you change your backend URL later, you **must rebuild and redeploy** the frontend image.
+</Warning>
+
+<Steps>
+
+### Navigate to Frontend Directory
+
+```bash
+cd /path/to/adma-sa2-sa3/frontend
+```
+
+### Build Frontend Image
+
+Build with the API URL as a build argument:
+
+```bash
+export API_URL="https://api.yourdomain.com"  # Your production backend URL
+
+docker build \
+  --build-arg VITE_API_BASE_URL=$API_URL \
+  -t $ECR_BASE/adma/frontend:latest \
+  -t $ECR_BASE/adma/frontend:$(git rev-parse --short HEAD) \
+  .
+```
+
+The build process:
+1. Uses `node:20-alpine` to install dependencies with Bun
+2. Builds the React application with Vite
+3. Packages the static files into `nginx:stable-alpine`
+4. Configures nginx for single-page application routing
+
+### Push Frontend Image
+
+Push both tags to ECR:
+
+```bash
+docker push $ECR_BASE/adma/frontend:latest
+docker push $ECR_BASE/adma/frontend:$(git rev-parse --short HEAD)
+```
+
+### Verify Frontend Image
+
+List images in the frontend repository:
+
+```bash
+aws ecr describe-images \
+  --repository-name adma/frontend \
+  --region $AWS_REGION
+```
+
+</Steps>
+
+## Build Arguments Reference
+
+### Backend Build Arguments
+
+The backend Dockerfile doesn't require build arguments. All configuration is provided via environment variables at runtime.
+
+### Frontend Build Arguments
+
+| Argument | Required | Example | Description |
+|----------|----------|---------|-------------|
+| `VITE_API_BASE_URL` | Yes | `https://api.example.com` | Backend API base URL (without trailing slash) |
+
+## Image Scanning Results
+
+View vulnerability scan results for your images:
+
+```bash
+# Backend scan results
+aws ecr describe-image-scan-findings \
+  --repository-name adma/backend \
+  --image-id imageTag=latest \
+  --region $AWS_REGION
+
+# Frontend scan results
+aws ecr describe-image-scan-findings \
+  --repository-name adma/frontend \
+  --image-id imageTag=latest \
+  --region $AWS_REGION
+```
+
+<Info>
+ECR automatically scans images for CVEs (Common Vulnerabilities and Exposures) when `scanOnPush=true` is enabled.
+</Info>
+
+## CI/CD Integration
+
+For automated builds in GitHub Actions, use this workflow:
+
+```yaml .github/workflows/build-push.yml
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-1.amazonaws.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/adma/backend:${{ github.sha }} \
+            -t $ECR_REGISTRY/adma/backend:latest \
+            ./backend
+          docker push $ECR_REGISTRY/adma/backend:${{ github.sha }}
+          docker push $ECR_REGISTRY/adma/backend:latest
+
+      - name: Build and push frontend
+        run: |
+          docker build \
+            --build-arg VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }} \
+            -t $ECR_REGISTRY/adma/frontend:${{ github.sha }} \
+            -t $ECR_REGISTRY/adma/frontend:latest \
+            ./frontend
+          docker push $ECR_REGISTRY/adma/frontend:${{ github.sha }}
+          docker push $ECR_REGISTRY/adma/frontend:latest
+```
+
+## Updating Images
+
+To deploy a new version of your application:
+
+<Steps>
+
+### Re-authenticate if Needed
+
+```bash
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin $ECR_BASE
+```
+
+### Rebuild and Push
+
+```bash
+# Backend
+cd backend
+docker build -t $ECR_BASE/adma/backend:latest .
+docker push $ECR_BASE/adma/backend:latest
+
+# Frontend (with API URL)
+cd ../frontend
+docker build \
+  --build-arg VITE_API_BASE_URL=$API_URL \
+  -t $ECR_BASE/adma/frontend:latest .
+docker push $ECR_BASE/adma/frontend:latest
+```
+
+### Force ECS to Pull New Images
+
+```bash
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --force-new-deployment \
+  --region $AWS_REGION
+
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-frontend \
+  --force-new-deployment \
+  --region $AWS_REGION
+```
+
+</Steps>
+
+<Note>
+ECS performs rolling updates automatically. Old tasks remain running until new tasks pass health checks.
+</Note>
+
+## Troubleshooting
+
+### Authentication Errors
+
+**Problem**: `no basic auth credentials`
+
+**Solution**: Re-authenticate with ECR:
+```bash
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin $ECR_BASE
+```
+
+### Build Fails - Out of Memory
+
+**Problem**: Docker build fails with memory errors
+
+**Solution**: Increase Docker Desktop memory allocation:
+- Docker Desktop → Settings → Resources → Memory → Increase to 4GB+
+
+### Image Tag Already Exists
+
+**Problem**: Cannot push image with existing tag
+
+**Solution**: ECR allows overwriting tags. This is normal behavior. Use commit SHA tags for immutable versions.
+
+## Next Steps
+
+With your Docker images in ECR:
+
+1. [Configure RDS Database](/deployment/rds-database) - Set up PostgreSQL
+2. [Set up ECS Fargate](/deployment/ecs-fargate) - Deploy containers
+3. [Configure Load Balancer](/deployment/load-balancer) - Set up routing

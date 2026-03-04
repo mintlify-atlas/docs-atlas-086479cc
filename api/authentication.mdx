@@ -1,0 +1,264 @@
+---
+title: Authentication
+description: Register new users and authenticate existing users with JWT tokens
+---
+
+The authentication endpoints allow users to register new accounts and log in to existing accounts. Both endpoints return a JWT token that must be included in subsequent authenticated requests.
+
+## Register New User
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "John Doe",
+    "email": "john@example.com",
+    "password": "securepassword123"
+  }'
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/auth/register', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    name: 'John Doe',
+    email: 'john@example.com',
+    password: 'securepassword123',
+  }),
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+response = requests.post(
+    'http://localhost:8080/api/auth/register',
+    json={
+        'name': 'John Doe',
+        'email': 'john@example.com',
+        'password': 'securepassword123'
+    }
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+POST /api/auth/register
+```
+
+### Request Body
+
+<ParamField body="name" type="string" required>
+  User's full name. Maximum 100 characters.
+</ParamField>
+
+<ParamField body="email" type="string" required>
+  Valid email address. Must be unique in the system.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  User password. Must be at least 8 characters long. Will be hashed using BCrypt with strength 12.
+</ParamField>
+
+### Response
+
+<ResponseField name="token" type="string">
+  JWT Bearer token (HS256, 24-hour validity). Include this in the `Authorization` header as `Bearer <token>` for authenticated requests.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  The registered user's name.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The registered user's email address (matches the JWT subject).
+</ResponseField>
+
+### Status Codes
+
+<ResponseField name="201 Created" type="Success">
+  User successfully registered. Returns JWT token and user details.
+</ResponseField>
+
+<ResponseField name="400 Bad Request" type="Error">
+  Invalid input data. Response includes field-level validation errors.
+
+  <Expandable title="Example Error Response">
+    ```json
+    {
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Validation failed",
+      "timestamp": "2024-03-15T10:30:00Z",
+      "fieldErrors": {
+        "email": "Email must be a valid address",
+        "password": "Password must be at least 8 characters"
+      }
+    }
+    ```
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="409 Conflict" type="Error">
+  Email address already registered.
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "name": "John Doe",
+  "email": "john@example.com"
+}
+```
+
+---
+
+## Login User
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "john@example.com",
+    "password": "securepassword123"
+  }'
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/auth/login', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    email: 'john@example.com',
+    password: 'securepassword123',
+  }),
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+response = requests.post(
+    'http://localhost:8080/api/auth/login',
+    json={
+        'email': 'john@example.com',
+        'password': 'securepassword123'
+    }
+)
+
+data = response.json()
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+POST /api/auth/login
+```
+
+### Request Body
+
+<ParamField body="email" type="string" required>
+  Registered email address.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  User password.
+</ParamField>
+
+### Response
+
+<ResponseField name="token" type="string">
+  JWT Bearer token (HS256, 24-hour validity). Include this in the `Authorization` header as `Bearer <token>` for authenticated requests.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  The authenticated user's name.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The authenticated user's email address (matches the JWT subject).
+</ResponseField>
+
+### Status Codes
+
+<ResponseField name="200 OK" type="Success">
+  User successfully authenticated. Returns JWT token and user details.
+</ResponseField>
+
+<ResponseField name="400 Bad Request" type="Error">
+  Invalid input data (e.g., malformed email).
+
+  <Expandable title="Example Error Response">
+    ```json
+    {
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Validation failed",
+      "timestamp": "2024-03-15T10:30:00Z",
+      "fieldErrors": {
+        "email": "Email must be a valid address"
+      }
+    }
+    ```
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="401 Unauthorized" type="Error">
+  Invalid credentials (email not found or incorrect password).
+
+  <Expandable title="Example Error Response">
+    ```json
+    {
+      "status": 401,
+      "error": "Unauthorized",
+      "message": "Invalid credentials",
+      "timestamp": "2024-03-15T10:30:00Z"
+    }
+    ```
+  </Expandable>
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "name": "John Doe",
+  "email": "john@example.com"
+}
+```
+
+## Authentication Flow
+
+1. **Register or Login**: Call `/api/auth/register` or `/api/auth/login` to obtain a JWT token
+2. **Store Token**: Save the token securely (e.g., localStorage, secure cookie)
+3. **Include in Requests**: Add the token to the `Authorization` header for authenticated endpoints:
+   ```
+   Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+   ```
+4. **Token Expiry**: Tokens expire after 24 hours. Request a new token by logging in again
+
+## Security Notes
+
+- Passwords are hashed using **BCrypt with strength 12** (OWASP recommendation)
+- JWT tokens are signed with **HS256** algorithm
+- Default token expiration: **24 hours** (configurable via `JWT_EXPIRATION_MS` environment variable)
+- The JWT secret key must be at least **32 characters** and stored securely (use AWS SSM Parameter Store in production)

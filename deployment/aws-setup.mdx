@@ -1,0 +1,252 @@
+---
+title: AWS Prerequisites and Setup
+description: Configure AWS CLI, IAM permissions, and essential prerequisites for deploying ADMA to AWS
+---
+
+Before deploying the ADMA URL Shortener to AWS, you need to configure your local environment and ensure you have the necessary permissions.
+
+## Required Tools
+
+<Steps>
+
+### Install AWS CLI v2
+
+The AWS Command Line Interface is required for all deployment operations.
+
+<CodeGroup>
+
+```bash Linux
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+```bash macOS
+curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+sudo installer -pkg AWSCLIV2.pkg -target /
+```
+
+```bash Windows
+msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi
+```
+
+</CodeGroup>
+
+Verify the installation:
+
+```bash
+aws --version
+# Expected output: aws-cli/2.x.x
+```
+
+### Configure AWS Credentials
+
+Set up your AWS credentials using the interactive configuration:
+
+```bash
+aws configure
+```
+
+You'll be prompted for:
+
+- **AWS Access Key ID**: Your access key from IAM
+- **AWS Secret Access Key**: Your secret key
+- **Default region name**: `eu-west-1` (or your preferred region)
+- **Default output format**: `json`
+
+<Note>
+For CI/CD pipelines, consider using AWS IAM OIDC for GitHub Actions instead of long-lived access keys.
+</Note>
+
+### Install Docker
+
+Docker is required to build and push container images to ECR.
+
+- **Docker Desktop**: [Download here](https://www.docker.com/products/docker-desktop/)
+- Ensure Docker is running before proceeding with image builds
+
+</Steps>
+
+## IAM Permissions
+
+Your AWS user or role must have the following permissions to deploy the infrastructure:
+
+<Warning>
+These are the **minimum required permissions** for deployment. In production, follow the principle of least privilege and create a dedicated deployment role.
+</Warning>
+
+### Required AWS Managed Policies
+
+Attach these managed policies to your IAM user or role:
+
+| Policy | Purpose |
+|--------|--------|
+| `AmazonECR_FullAccess` | Create repositories, push Docker images |
+| `AmazonECS_FullAccess` | Create clusters, task definitions, services |
+| `AmazonRDSFullAccess` | Create and manage RDS PostgreSQL instance |
+| `ElasticLoadBalancingFullAccess` | Create ALB, target groups, listeners |
+| `AmazonSSMFullAccess` | Store secrets in Parameter Store |
+| `AmazonVPCFullAccess` | Configure networking, security groups |
+| `IAMFullAccess` | Create task execution roles |
+| `AWSCertificateManagerFullAccess` | Request and manage SSL/TLS certificates |
+
+### Custom Deployment Policy (Recommended)
+
+For better security, create a custom policy with only the required permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecr:*",
+        "ecs:*",
+        "rds:*",
+        "elasticloadbalancing:*",
+        "ssm:PutParameter",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "iam:CreateRole",
+        "iam:AttachRolePolicy",
+        "iam:GetRole",
+        "iam:PassRole",
+        "logs:CreateLogGroup",
+        "logs:DescribeLogGroups",
+        "acm:RequestCertificate",
+        "acm:DescribeCertificate",
+        "acm:ListCertificates"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+## Environment Setup
+
+Export these environment variables to use throughout the deployment process:
+
+```bash
+export AWS_REGION="eu-west-1"  # Your AWS region
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export ECR_BASE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+export APP_DOMAIN="yourdomain.com"  # Your production domain
+export API_URL="https://api.$APP_DOMAIN"  # Backend API URL
+```
+
+Verify the setup:
+
+```bash
+echo $ACCOUNT_ID   # Should print your 12-digit AWS account ID
+echo $ECR_BASE     # Should print your ECR registry URL
+```
+
+<Info>
+Add these variables to your `.bashrc` or `.zshrc` to persist them across terminal sessions.
+</Info>
+
+## Network Architecture Overview
+
+The ADMA deployment uses the following AWS network architecture:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  VPC  10.0.0.0/16                                                   │
+│                                                                     │
+│  ┌─────────────────────┐    ┌─────────────────────┐                 │
+│  │  Public Subnet A    │    │  Public Subnet B    │                 │
+│  │  10.0.1.0/24        │    │  10.0.2.0/24        │                 │
+│  │                     │    │                     │                 │
+│  │  ┌───────────────┐  │    │                     │                 │
+│  │  │      ALB      │  │    │                     │                 │
+│  │  │  :80 → :443   │  │    │                     │                 │
+│  │  └───────┬───────┘  │    │                     │                 │
+│  └──────────┼──────────┘    └─────────────────────┘                 │
+│             │                                                       │
+│  ┌──────────┼──────────────────────────────────────┐                │
+│  │  Private Subnet A          Private Subnet B     │                │
+│  │  10.0.10.0/24              10.0.11.0/24         │                │
+│  │                                                 │                │
+│  │  ┌─────────────┐         ┌─────────────┐        │                │
+│  │  │  ECS Task   │         │  ECS Task   │        │                │
+│  │  │  Frontend   │         │  Backend    │        │                │
+│  │  │  nginx:80   │         │  spring:8080│        │                │
+│  │  └─────────────┘         └──────┬──────┘        │                │
+│  │                                 │               │                │
+│  │  ┌──────────────────────────────▼─────────────┐ │                │
+│  │  │         RDS PostgreSQL 16                  │ │                │
+│  │  │         (no public access)                 │ │                │
+│  │  └────────────────────────────────────────────┘ │                │
+│  └─────────────────────────────────────────────────┘                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Traffic Flow
+
+1. User requests → Route 53 → ALB (HTTPS :443)
+2. ALB automatically redirects HTTP :80 → HTTPS :443
+3. ALB routes to:
+   - Frontend target group (nginx:80) for `/` routes
+   - Backend target group (spring:8080) for `/api/*` and `/{shortCode}` routes
+4. Backend connects to RDS in private subnet
+5. All containers run in private subnets with no public IPs
+
+## Verification
+
+Before proceeding to the next steps, verify your setup:
+
+<Steps>
+
+### Check AWS CLI Access
+
+```bash
+aws sts get-caller-identity
+```
+
+Expected output:
+```json
+{
+    "UserId": "AIDACKCEVSQ6C2EXAMPLE",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/your-username"
+}
+```
+
+### Verify Docker
+
+```bash
+docker --version
+docker ps
+```
+
+Docker should be running without errors.
+
+### Test AWS Permissions
+
+List existing ECR repositories (should work without errors):
+
+```bash
+aws ecr describe-repositories --region $AWS_REGION
+```
+
+</Steps>
+
+<Note>
+If you encounter permission errors, contact your AWS administrator to verify your IAM policies.
+</Note>
+
+## Next Steps
+
+Once your AWS environment is configured:
+
+1. [Create ECR Repositories](/deployment/ecr-images) - Set up Docker image storage
+2. [Configure RDS Database](/deployment/rds-database) - Create PostgreSQL instance
+3. [Set up ECS Fargate](/deployment/ecs-fargate) - Deploy containers

@@ -1,0 +1,457 @@
+---
+title: Network Architecture
+description: VPC setup, public and private subnets, route tables, Internet Gateway, and VPC endpoints
+---
+
+The ADMA infrastructure uses a dedicated VPC with public and private subnets across multiple availability zones. This design provides high availability, security isolation, and cost optimization.
+
+## VPC Architecture
+
+### Network Design
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  VPC: 10.42.0.0/16                                                  │
+│                                                                     │
+│  ┌──────────────────────┐       ┌──────────────────────┐           │
+│  │ AZ-A                 │       │ AZ-B                 │           │
+│  │                      │       │                      │           │
+│  │ ┌─────────────────┐  │       │ ┌─────────────────┐  │           │
+│  │ │ Public Subnet A │  │       │ │ Public Subnet B │  │           │
+│  │ │ 10.42.0.0/24    │  │       │ │ 10.42.1.0/24    │  │           │
+│  │ │                 │  │       │ │                 │  │           │
+│  │ │   ┌───────┐     │  │       │ │                 │  │           │
+│  │ │   │  ALB  │     │  │       │ │                 │  │           │
+│  │ │   └───┬───┘     │  │       │ │                 │  │           │
+│  │ └───────┼─────────┘  │       │ └─────────────────┘  │           │
+│  │         │            │       │                      │           │
+│  │ ┌───────▼─────────┐  │       │ ┌─────────────────┐  │           │
+│  │ │ Private Subnet A│  │       │ │ Private Subnet B│  │           │
+│  │ │ 10.42.10.0/24   │  │       │ │ 10.42.11.0/24   │  │           │
+│  │ │                 │  │       │ │                 │  │           │
+│  │ │ ECS Tasks       │  │       │ │ ECS Tasks       │  │           │
+│  │ │ RDS Instance    │  │       │ │ RDS Standby     │  │           │
+│  │ │ VPC Endpoints   │  │       │ │ VPC Endpoints   │  │           │
+│  │ └─────────────────┘  │       │ └─────────────────┘  │           │
+│  └──────────────────────┘       └──────────────────────┘           │
+│                                                                     │
+│  Internet Gateway                                                   │
+│  └─ Routes to public subnets                                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## VPC Configuration
+
+The VPC is created in the `network` module:
+
+```hcl
+# modules/network/main.tf
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-vpc"
+  })
+}
+```
+
+**Key settings:**
+- `enable_dns_support = true` — Required for VPC endpoints
+- `enable_dns_hostnames = true` — Enables DNS resolution for ECS service discovery
+- Default CIDR: `10.42.0.0/16` (65,536 IP addresses)
+
+<Info>
+**Design Decision**: The `10.42.0.0/16` range avoids common overlaps with corporate networks (often `10.0.0.0/8` or `172.16.0.0/12`).
+</Info>
+
+## Availability Zones
+
+The infrastructure automatically selects available AZs in your region:
+
+```hcl
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+locals {
+  azs = slice(
+    data.aws_availability_zones.available.names,
+    0,
+    min(var.availability_zone_cnt, length(data.aws_availability_zones.available.names))
+  )
+}
+```
+
+**Result**: If you configure 2 public and 2 private subnets, they'll be distributed across 2 AZs automatically.
+
+## Public Subnets
+
+Public subnets host the Application Load Balancer (ALB) only:
+
+```hcl
+resource "aws_subnet" "public" {
+  count = length(var.public_subnet_cidrs)
+
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = local.azs[count.index % length(local.azs)]
+  map_public_ip_on_launch = false
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-public-${count.index + 1}"
+    Tier = "public"
+  })
+}
+```
+
+<Note>
+`map_public_ip_on_launch = false` — Even public subnets don't auto-assign public IPs. The ALB receives a public IP through AWS's managed service.
+</Note>
+
+**Default configuration:**
+```hcl
+public_subnet_cidrs = [
+  "10.42.0.0/24",  # 256 IPs in AZ-A
+  "10.42.1.0/24"   # 256 IPs in AZ-B
+]
+```
+
+## Private Subnets
+
+Private subnets host ECS tasks, RDS database, and VPC endpoints:
+
+```hcl
+resource "aws_subnet" "private" {
+  count = length(var.private_subnet_cidrs)
+
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.private_subnet_cidrs[count.index]
+  availability_zone       = local.azs[count.index % length(local.azs)]
+  map_public_ip_on_launch = false
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-private-${count.index + 1}"
+    Tier = "private"
+  })
+}
+```
+
+**Default configuration:**
+```hcl
+private_subnet_cidrs = [
+  "10.42.10.0/24",  # 256 IPs in AZ-A
+  "10.42.11.0/24"   # 256 IPs in AZ-B
+]
+```
+
+**What runs here:**
+- ECS Fargate tasks (frontend + backend)
+- RDS PostgreSQL instance
+- Interface VPC endpoints (ECR, CloudWatch, Secrets Manager)
+
+## Internet Gateway
+
+The Internet Gateway provides internet access to public subnets:
+
+```hcl
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-igw"
+  })
+}
+```
+
+**Traffic flow:**
+1. ALB in public subnet receives external HTTP/HTTPS requests
+2. ALB forwards traffic to ECS tasks in private subnets
+3. ECS tasks respond through ALB back to internet via IGW
+
+## Route Tables
+
+### Public Route Table
+
+Public subnets share a single route table with internet access:
+
+```hcl
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.this.id
+  }
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-public-rt"
+  })
+}
+
+resource "aws_route_table_association" "public" {
+  count = length(aws_subnet.public)
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+```
+
+**Routes:**
+| Destination | Target | Description |
+|-------------|--------|-------------|
+| `10.42.0.0/16` | local | VPC-internal traffic |
+| `0.0.0.0/0` | IGW | All internet traffic |
+
+### Private Route Tables
+
+Each private subnet gets its own route table (prepared for future NAT Gateway if needed):
+
+```hcl
+resource "aws_route_table" "private" {
+  count = length(aws_subnet.private)
+
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-private-rt-${count.index + 1}"
+  })
+}
+
+resource "aws_route_table_association" "private" {
+  count = length(aws_subnet.private)
+
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+```
+
+**Routes:**
+| Destination | Target | Description |
+|-------------|--------|-------------|
+| `10.42.0.0/16` | local | VPC-internal traffic only |
+
+<Warning>
+**No NAT Gateway**: Private subnets have NO route to the internet. All AWS service access is via VPC endpoints. This saves ~$32/month per NAT Gateway.
+</Warning>
+
+## VPC Endpoints
+
+VPC endpoints allow private subnet resources to access AWS services without internet:
+
+### Interface Endpoints
+
+Created in the `vpc_endpoints` module for private AWS API access:
+
+```hcl
+# modules/vpc_endpoints/main.tf
+
+locals {
+  interface_endpoint_services = {
+    ecr_api = "com.amazonaws.${var.region}.ecr.api"
+    ecr_dkr = "com.amazonaws.${var.region}.ecr.dkr"
+    logs    = "com.amazonaws.${var.region}.logs"
+    secretsmanager = "com.amazonaws.${var.region}.secretsmanager"
+  }
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each = local.interface_endpoint_services
+
+  vpc_id              = var.vpc_id
+  service_name        = each.value
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = var.private_subnet_ids
+  security_group_ids  = [var.endpoint_security_group]
+  private_dns_enabled = true
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-${each.key}-endpoint"
+  })
+}
+```
+
+**Required endpoints:**
+- `ecr.api` — ECR image manifest APIs
+- `ecr.dkr` — Docker image layer downloads
+- `logs` — CloudWatch Logs for ECS task logs
+- `secretsmanager` — Secrets Manager for DB password and JWT secret
+
+### S3 Gateway Endpoint
+
+Gateway endpoint for S3 (ECR stores layers in S3):
+
+```hcl
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = var.private_route_table_ids
+
+  tags = merge(var.tags, {
+    Name = "${local.name_prefix}-s3-endpoint"
+  })
+}
+```
+
+<Info>
+**Cost**: Gateway endpoints are free. Interface endpoints cost ~$7/month per endpoint per AZ. This infrastructure uses 4 interface endpoints across 2 AZs = ~$56/month, still cheaper than 2 NAT Gateways (~$64/month).
+</Info>
+
+## Network Flow Examples
+
+<Tabs>
+  <Tab title="External Request">
+    User accesses `https://go.example.com`:
+
+    1. DNS resolves to ALB public IP
+    2. Request hits ALB in public subnet
+    3. ALB security group allows port 443
+    4. ALB forwards to frontend ECS task in private subnet
+    5. Frontend task processes request
+    6. Response flows back through ALB to user
+  </Tab>
+  <Tab title="Frontend → Backend">
+    Frontend container calls backend API:
+
+    1. Frontend uses service discovery DNS: `backend.adma.internal:8080`
+    2. AWS Cloud Map resolves to backend task IPs in private subnet
+    3. Frontend security group allows egress to backend SG on port 8080
+    4. Backend security group allows ingress from frontend SG
+    5. Backend responds directly (same VPC, no ALB)
+  </Tab>
+  <Tab title="Backend → RDS">
+    Backend connects to database:
+
+    1. Backend uses RDS endpoint: `adma-prod-postgres.xxxxx.eu-west-1.rds.amazonaws.com`
+    2. DNS resolves to RDS instance private IP
+    3. Backend security group allows egress to DB SG on port 5432
+    4. DB security group allows ingress from backend SG
+    5. Connection established with TLS (enforced by `rds.force_ssl=1`)
+  </Tab>
+  <Tab title="ECS Task Startup">
+    ECS task pulls container image:
+
+    1. ECS agent needs image from ECR
+    2. Connects to `ecr.api` VPC endpoint (private DNS resolves to endpoint IP)
+    3. Endpoint security group allows ingress from task SG on port 443
+    4. ECR API returns image manifest
+    5. Agent downloads layers from S3 via S3 gateway endpoint
+    6. Task starts, reads secrets from Secrets Manager endpoint
+  </Tab>
+</Tabs>
+
+## High Availability Design
+
+The network is designed for high availability:
+
+### Multi-AZ Deployment
+
+| Component | AZ Distribution | Purpose |
+|-----------|----------------|----------|
+| **ALB** | All public subnets | Automatic failover across AZs |
+| **ECS Tasks** | All private subnets | Tasks distributed by ECS scheduler |
+| **RDS** | 2 AZs (if Multi-AZ enabled) | Synchronous replication to standby |
+| **VPC Endpoints** | All private subnets | Redundant endpoint ENIs |
+
+### Subnet Sizing Considerations
+
+<Accordion title="IP Address Planning">
+  Each `/24` subnet provides:
+  - **251 usable IPs** (5 reserved by AWS)
+  - AWS reserves: `.0`, `.1` (router), `.2` (DNS), `.3` (future), `.255`
+
+  **Private subnet IP usage:**
+  - ECS tasks: ~10-50 IPs (depends on scaling)
+  - RDS: 1 IP (2 if Multi-AZ)
+  - VPC endpoints: 4 endpoints × 1 IP each = 4 IPs
+  - Total: ~60 IPs per subnet (leaves ~190 spare)
+
+  **Public subnet IP usage:**
+  - ALB: ~8-10 IPs (AWS managed)
+  - Total: ~10 IPs per subnet (leaves ~240 spare)
+</Accordion>
+
+## Network Security
+
+Security is enforced at multiple layers:
+
+1. **Subnet Isolation**: Private subnets have no internet route
+2. **Security Groups**: See [Security Groups →](/infrastructure/security-groups)
+3. **NACLs**: Default VPC NACLs allow all traffic (security enforced via SGs)
+4. **TLS in Transit**:
+   - ALB terminates TLS
+   - Backend → RDS: TLS enforced via `sslmode=require`
+   - ECS → VPC endpoints: TLS (port 443)
+
+## Cost Optimization
+
+### No NAT Gateway Strategy
+
+**Traditional approach:**
+```
+Private subnet → NAT Gateway (public subnet) → Internet Gateway
+Cost: $32.40/month per NAT Gateway + $0.045/GB processed
+```
+
+**This infrastructure:**
+```
+Private subnet → VPC Endpoints (interface/gateway) → AWS Services
+Cost: Interface endpoints only (~$7/month per endpoint per AZ)
+```
+
+**Savings**: ~$40-50/month for typical workload
+
+<Warning>
+**Limitation**: ECS tasks cannot make arbitrary internet requests. All external service calls must go through VPC endpoints. If you need internet access (e.g., for third-party APIs), add a NAT Gateway to the root `main.tf`.
+</Warning>
+
+### Endpoint Usage Patterns
+
+| Endpoint | Used By | Traffic Pattern |
+|----------|---------|----------------|
+| **ecr.api / ecr.dkr** | ECS | Burst during task startup, idle otherwise |
+| **logs** | ECS tasks | Constant (application logs) |
+| **secretsmanager** | ECS | Once per task startup |
+| **s3** | ECS | Burst during image pull (layers) |
+
+## Module Outputs
+
+The network module exposes these outputs for other modules:
+
+```hcl
+# modules/network/outputs.tf
+
+output "vpc_id" {
+  description = "ID of the created VPC"
+  value       = aws_vpc.this.id
+}
+
+output "vpc_cidr" {
+  description = "CIDR block of the VPC"
+  value       = aws_vpc.this.cidr_block
+}
+
+output "public_subnet_ids" {
+  description = "List of public subnet IDs"
+  value       = aws_subnet.public[*].id
+}
+
+output "private_subnet_ids" {
+  description = "List of private subnet IDs"
+  value       = aws_subnet.private[*].id
+}
+
+output "private_route_table_ids" {
+  description = "List of private route table IDs"
+  value       = aws_route_table.private[*].id
+}
+```
+
+These outputs are used by:
+- `security` module (needs VPC ID and CIDR)
+- `rds` module (needs private subnet IDs)
+- `ecs` module (needs public and private subnet IDs)
+- `vpc_endpoints` module (needs VPC ID, private subnet IDs, route table IDs)

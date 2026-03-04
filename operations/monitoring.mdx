@@ -1,0 +1,501 @@
+---
+title: Monitoring & Observability
+description: CloudWatch logs, metrics, Container Insights, and health checks for ADMA Cloud infrastructure
+---
+
+Monitor your ADMA URL shortener deployment with AWS CloudWatch, Container Insights, and application-level health checks.
+
+## CloudWatch Logs
+
+All application logs are centralized in CloudWatch Logs with structured log groups.
+
+### Log Groups
+
+The infrastructure creates two primary log groups:
+
+<CodeGroup>
+```bash Frontend Logs
+/ecs/adma-prod-frontend
+```
+
+```bash Backend Logs
+/ecs/adma-prod-backend
+```
+</CodeGroup>
+
+<Note>
+Log group names follow the pattern `/ecs/{project_name}-{environment}-{service}`. Replace `prod` with your environment name.
+</Note>
+
+### Log Retention
+
+Logs are retained for a configurable period (default: 30 days) to balance cost and compliance:
+
+```hcl infrastructure/terraform/modules/ecs/main.tf
+resource "aws_cloudwatch_log_group" "backend" {
+  name              = "/ecs/${local.name_prefix}-backend"
+  retention_in_days = var.ecs_log_retention_days
+}
+```
+
+### RDS PostgreSQL Logs
+
+Database logs are automatically exported to CloudWatch:
+
+```hcl infrastructure/terraform/modules/rds/main.tf
+resource "aws_db_instance" "this" {
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  # ...
+}
+```
+
+Access PostgreSQL logs at:
+```
+/aws/rds/instance/adma-prod-postgres/postgresql
+```
+
+### Viewing Logs
+
+<Accordion title="Using AWS Console">
+1. Navigate to **CloudWatch** → **Logs** → **Log groups**
+2. Select the log group (e.g., `/ecs/adma-prod-backend`)
+3. Click on a log stream to view entries
+4. Use **Filter events** to search for specific patterns
+</Accordion>
+
+<Accordion title="Using AWS CLI">
+```bash
+# Tail backend logs in real-time
+aws logs tail /ecs/adma-prod-backend --follow --region eu-west-1
+
+# Filter logs for errors
+aws logs filter-log-events \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-pattern "ERROR" \
+  --start-time $(date -u -d '1 hour ago' +%s)000
+
+# Get the last 50 events
+aws logs tail /ecs/adma-prod-backend --since 1h --format short
+```
+</Accordion>
+
+### Log Stream Prefix
+
+Each task creates a unique log stream:
+```
+{stream-prefix}/{container-name}/{task-id}
+```
+
+Example:
+```
+backend/backend/a1b2c3d4e5f6
+```
+
+## Container Insights
+
+Container Insights provides enhanced metrics for ECS clusters, services, and tasks.
+
+### Enable Container Insights
+
+Container Insights is configured at the cluster level:
+
+```hcl infrastructure/terraform/modules/ecs/main.tf
+resource "aws_ecs_cluster" "this" {
+  name = local.cluster_name
+
+  setting {
+    name  = "containerInsights"
+    value = var.enable_container_insights ? "enabled" : "disabled"
+  }
+}
+```
+
+<Tip>
+Enable Container Insights by setting `enable_container_insights = true` in your Terraform variables.
+</Tip>
+
+### Available Metrics
+
+Container Insights automatically collects:
+
+- **CPU utilization** (cluster, service, task level)
+- **Memory utilization** (cluster, service, task level)
+- **Network metrics** (bytes in/out, packets)
+- **Task count** (running, pending, desired)
+- **Disk I/O** (read/write bytes)
+
+### Viewing Container Insights
+
+1. Navigate to **CloudWatch** → **Container Insights**
+2. Select your ECS cluster: `adma-prod-ecs`
+3. View metrics by:
+   - Cluster performance
+   - Service performance
+   - Task performance
+
+## Health Checks
+
+### Application Load Balancer Health Checks
+
+The ALB continuously monitors target health:
+
+```hcl infrastructure/terraform/modules/ecs/main.tf
+resource "aws_lb_target_group" "frontend" {
+  health_check {
+    enabled             = true
+    path                = "/"
+    matcher             = "200-399"
+    protocol            = "HTTP"
+    interval            = 30
+    timeout             = 6
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+```
+
+<Accordion title="Health Check Parameters">
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Path** | `/` (frontend)<br/>`/actuator/health` (backend) | Endpoint to check |
+| **Interval** | 30 seconds | Time between checks |
+| **Timeout** | 6 seconds (frontend)<br/>10 seconds (backend) | Max wait time |
+| **Healthy threshold** | 2 consecutive successes | Mark as healthy |
+| **Unhealthy threshold** | 3 consecutive failures | Mark as unhealthy |
+| **Matcher** | 200-399 | Acceptable status codes |
+</Accordion>
+
+### ECS Container Health Checks
+
+Each task definition includes container-level health checks:
+
+<CodeGroup>
+```json Frontend Health Check
+"healthCheck": {
+  "command": [
+    "CMD-SHELL",
+    "wget -q -O /dev/null http://localhost:80/ || exit 1"
+  ],
+  "interval": 30,
+  "timeout": 5,
+  "retries": 3,
+  "startPeriod": 15
+}
+```
+
+```json Backend Health Check
+"healthCheck": {
+  "command": [
+    "CMD-SHELL",
+    "wget -q -O /dev/null http://localhost:8080/actuator/health || exit 1"
+  ],
+  "interval": 30,
+  "timeout": 10,
+  "retries": 3,
+  "startPeriod": 60
+}
+```
+</CodeGroup>
+
+<Note>
+The `startPeriod` gives the container time to initialize before health checks begin. Backend has a longer start period (60s) to allow for database migrations.
+</Note>
+
+### Spring Boot Actuator Endpoint
+
+The backend exposes a health endpoint at `/actuator/health`:
+
+```json Response Example
+{
+  "status": "UP",
+  "components": {
+    "db": {
+      "status": "UP",
+      "details": {
+        "database": "PostgreSQL",
+        "validationQuery": "isValid()"
+      }
+    },
+    "diskSpace": {
+      "status": "UP"
+    }
+  }
+}
+```
+
+Test the endpoint:
+```bash
+curl https://api.yourdomain.com/actuator/health
+```
+
+## Auto Scaling Metrics
+
+ECS services automatically scale based on target tracking policies.
+
+### Frontend Scaling
+
+<CodeGroup>
+```hcl CPU-Based Scaling
+resource "aws_appautoscaling_policy" "frontend_cpu" {
+  name               = "${local.frontend_service_name}-cpu"
+  policy_type        = "TargetTrackingScaling"
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    target_value       = var.frontend_target_cpu_utilization
+    scale_in_cooldown  = 60
+    scale_out_cooldown = 60
+  }
+}
+```
+
+```hcl Memory-Based Scaling
+resource "aws_appautoscaling_policy" "frontend_memory" {
+  name               = "${local.frontend_service_name}-memory"
+  policy_type        = "TargetTrackingScaling"
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageMemoryUtilization"
+    }
+    target_value       = var.frontend_target_memory_utilization
+    scale_in_cooldown  = 60
+    scale_out_cooldown = 60
+  }
+}
+```
+</CodeGroup>
+
+### Backend Scaling
+
+The backend uses identical scaling policies with separate target values.
+
+<Warning>
+The backend typically runs with `desired_count = 1` due to the scheduled cleanup job. Scaling beyond 1 task requires migrating the scheduled task to a separate ECS Scheduled Task or implementing distributed locking.
+</Warning>
+
+## Key Metrics to Monitor
+
+### Service-Level Metrics
+
+<AccordionGroup>
+<Accordion title="CPU & Memory Utilization">
+- **Namespace**: `AWS/ECS`
+- **Metrics**: `CPUUtilization`, `MemoryUtilization`
+- **Dimensions**: `ServiceName`, `ClusterName`
+- **Recommended threshold**: < 80% sustained
+
+```bash Query Example
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ECS \
+  --metric-name CPUUtilization \
+  --dimensions Name=ServiceName,Value=adma-prod-backend Name=ClusterName,Value=adma-prod-ecs \
+  --start-time 2026-03-04T00:00:00Z \
+  --end-time 2026-03-04T23:59:59Z \
+  --period 300 \
+  --statistics Average
+```
+</Accordion>
+
+<Accordion title="Target Health">
+- **Namespace**: `AWS/ApplicationELB`
+- **Metrics**: `HealthyHostCount`, `UnHealthyHostCount`
+- **Dimensions**: `TargetGroup`, `LoadBalancer`
+- **Alert if**: `UnHealthyHostCount > 0`
+
+```bash Query Example
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ApplicationELB \
+  --metric-name HealthyHostCount \
+  --dimensions Name=TargetGroup,Value=targetgroup/adma-prod-feg/abc123 \
+  --start-time 2026-03-04T00:00:00Z \
+  --end-time 2026-03-04T23:59:59Z \
+  --period 60 \
+  --statistics Minimum
+```
+</Accordion>
+
+<Accordion title="ALB Request Metrics">
+- **Namespace**: `AWS/ApplicationELB`
+- **Metrics**: `RequestCount`, `TargetResponseTime`, `HTTPCode_Target_5XX_Count`
+- **Dimensions**: `LoadBalancer`
+- **Alert if**: 5XX errors > threshold OR response time > 3s
+
+```bash Query Example
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ApplicationELB \
+  --metric-name TargetResponseTime \
+  --dimensions Name=LoadBalancer,Value=app/adma-prod-alb/abc123 \
+  --start-time 2026-03-04T00:00:00Z \
+  --end-time 2026-03-04T23:59:59Z \
+  --period 300 \
+  --statistics Average
+```
+</Accordion>
+
+<Accordion title="RDS Performance">
+- **Namespace**: `AWS/RDS`
+- **Metrics**: `CPUUtilization`, `DatabaseConnections`, `FreeableMemory`, `ReadLatency`, `WriteLatency`
+- **Dimensions**: `DBInstanceIdentifier`
+- **Alert if**: CPU > 80%, connections > 80% of max
+
+```bash Query Example
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name DatabaseConnections \
+  --dimensions Name=DBInstanceIdentifier,Value=adma-prod-postgres \
+  --start-time 2026-03-04T00:00:00Z \
+  --end-time 2026-03-04T23:59:59Z \
+  --period 300 \
+  --statistics Average,Maximum
+```
+</Accordion>
+</AccordionGroup>
+
+## Creating CloudWatch Alarms
+
+Set up alarms to receive notifications when metrics exceed thresholds.
+
+### Example: High Backend CPU
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name adma-prod-backend-high-cpu \
+  --alarm-description "Backend CPU utilization is too high" \
+  --metric-name CPUUtilization \
+  --namespace AWS/ECS \
+  --statistic Average \
+  --period 300 \
+  --threshold 80 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 2 \
+  --dimensions Name=ServiceName,Value=adma-prod-backend Name=ClusterName,Value=adma-prod-ecs \
+  --alarm-actions arn:aws:sns:eu-west-1:123456789012:ops-alerts
+```
+
+### Example: ALB 5XX Errors
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name adma-prod-alb-5xx-errors \
+  --alarm-description "ALB returning 5xx errors" \
+  --metric-name HTTPCode_Target_5XX_Count \
+  --namespace AWS/ApplicationELB \
+  --statistic Sum \
+  --period 60 \
+  --threshold 10 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 \
+  --dimensions Name=LoadBalancer,Value=app/adma-prod-alb/abc123 \
+  --alarm-actions arn:aws:sns:eu-west-1:123456789012:ops-alerts
+```
+
+### Example: RDS Connection Saturation
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name adma-prod-rds-connections-high \
+  --alarm-description "RDS connections near maximum" \
+  --metric-name DatabaseConnections \
+  --namespace AWS/RDS \
+  --statistic Average \
+  --period 300 \
+  --threshold 80 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 2 \
+  --dimensions Name=DBInstanceIdentifier,Value=adma-prod-postgres \
+  --alarm-actions arn:aws:sns:eu-west-1:123456789012:ops-alerts
+```
+
+<Tip>
+Create an SNS topic for alarm notifications and subscribe your email or Slack webhook:
+```bash
+aws sns create-topic --name ops-alerts
+aws sns subscribe \
+  --topic-arn arn:aws:sns:eu-west-1:123456789012:ops-alerts \
+  --protocol email \
+  --notification-endpoint ops@example.com
+```
+</Tip>
+
+## Application-Level Metrics
+
+The URL shortener exposes custom metrics through the `/api/stats` endpoint.
+
+### Public Statistics Endpoint
+
+```bash
+curl https://api.yourdomain.com/api/stats
+```
+
+```json Response
+{
+  "totalLinks": 1523,
+  "totalRedirects": 8471,
+  "avgLatencyMs": 12.4
+}
+```
+
+These metrics are computed in real-time using:
+- `ShortUrlRepository.countByLinkStatus(LinkStatus.ACTIVE)`
+- `ShortUrlRepository.sumAllClickCounts()`
+- Welford's algorithm for rolling average latency
+
+<Note>
+For production monitoring, consider exporting these metrics to CloudWatch using the CloudWatch Agent or custom metric API calls.
+</Note>
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Set Appropriate Retention Periods">
+Balance cost and compliance:
+- **Development**: 7 days
+- **Staging**: 14 days
+- **Production**: 30-90 days
+
+Update `ecs_log_retention_days` in your Terraform variables.
+</Accordion>
+
+<Accordion title="Use Metric Filters for Custom Alerts">
+Create metric filters to track specific log patterns:
+
+```bash
+aws logs put-metric-filter \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-name ErrorCount \
+  --filter-pattern "[time, request_id, level=ERROR*, ...]" \
+  --metric-transformations \
+    metricName=BackendErrors,\
+    metricNamespace=ADMA/Application,\
+    metricValue=1
+```
+</Accordion>
+
+<Accordion title="Enable X-Ray for Distributed Tracing">
+For advanced tracing of requests across services, integrate AWS X-Ray by:
+1. Adding X-Ray SDK to the Spring Boot backend
+2. Enabling X-Ray in the task definition
+3. Updating IAM task role permissions
+</Accordion>
+
+<Accordion title="Monitor Scheduled Task Execution">
+The backend runs a cleanup job every 15 minutes. Monitor its execution:
+
+```bash
+# Search logs for cleanup job execution
+aws logs filter-log-events \
+  --log-group-name /ecs/adma-prod-backend \
+  --filter-pattern "ExpiredUrlCleanupService" \
+  --start-time $(date -u -d '1 hour ago' +%s)000
+```
+</Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Set up [CI/CD pipelines](/operations/cicd) for automated deployments
+- Learn [troubleshooting techniques](/operations/troubleshooting) for common issues
+- Review [security groups](/infrastructure/security-groups) and [secrets management](/infrastructure/secrets-management) for production environments

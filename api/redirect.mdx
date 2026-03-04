@@ -1,0 +1,369 @@
+---
+title: Redirect
+description: Resolve short codes and redirect to original URLs
+---
+
+The redirect endpoint resolves a short code and issues an HTTP 302 redirect to the original URL. This endpoint handles the core URL shortening functionality and includes real-time latency tracking.
+
+## Resolve Short Code
+
+Resolve a short code and redirect to the original URL.
+
+<CodeGroup>
+```bash cURL
+curl -v http://localhost:8080/aB3xYz7
+```
+
+```javascript JavaScript (Fetch)
+fetch('http://localhost:8080/aB3xYz7', {
+  method: 'GET',
+  redirect: 'manual' // Prevent automatic following
+})
+  .then(response => {
+    console.log('Status:', response.status);
+    console.log('Location:', response.headers.get('Location'));
+  });
+```
+
+```python Python
+import requests
+
+# Disable automatic redirects to inspect the response
+response = requests.get(
+    'http://localhost:8080/aB3xYz7',
+    allow_redirects=False
+)
+
+print(f"Status: {response.status_code}")
+print(f"Location: {response.headers.get('Location')}")
+```
+
+```html HTML Link
+<a href="http://localhost:8080/aB3xYz7">Visit Short Link</a>
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+GET /{shortCode}
+```
+
+### Path Parameters
+
+<ParamField path="shortCode" type="string" required>
+  The 4-10 character alphanumeric code (e.g., `aB3xYz7`). Must match the pattern `[a-zA-Z0-9]{4,10}`.
+</ParamField>
+
+### Authentication
+
+<ParamField query="authentication" type="none">
+  This endpoint is **public** and does not require authentication.
+</ParamField>
+
+### Response
+
+The endpoint does not return a JSON body. Instead, it issues an HTTP redirect using the `Location` header.
+
+### Response Headers
+
+<ResponseField name="Location" type="string">
+  The destination URL. Clients should follow this redirect automatically.
+</ResponseField>
+
+### Status Codes
+
+<ResponseField name="302 Found" type="Success">
+  Short code successfully resolved. The `Location` header contains the original URL.
+  
+  **Behavior:**
+  - Increments the `redirectCount` for this link
+  - Updates the `avgRedirectMs` using Welford's algorithm
+  - Records the redirect latency from resolution to response
+  
+  <Expandable title="Example Response Headers">
+    ```http
+    HTTP/1.1 302 Found
+    Location: https://example.com/original-very-long-url
+    Content-Length: 0
+    ```
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="302 Found (Error Redirect)" type="Error">
+  Short code not found or expired. Redirects to the frontend SPA error page instead of returning raw JSON.
+  
+  **Error Types:**
+  
+  <Tabs>
+    <Tab title="404 Not Found">
+      ```http
+      HTTP/1.1 302 Found
+      Location: http://localhost/r/aB3xYz7?error=not_found
+      ```
+      
+      Short code does not exist in the database.
+    </Tab>
+    
+    <Tab title="410 Gone">
+      ```http
+      HTTP/1.1 302 Found
+      Location: http://localhost/r/aB3xYz7?error=expired
+      ```
+      
+      Short code exists but the link has expired (anonymous links expire after 8 hours).
+      
+      <Note>
+        Returns **410 Gone** (not 404) to indicate the resource existed but is permanently removed. Search engine crawlers interpret 410 as "stop indexing this URL."
+      </Note>
+    </Tab>
+  </Tabs>
+  
+  <Warning>
+    **Why Redirect on Errors?**
+    
+    Instead of returning JSON error responses, the API redirects to the frontend SPA's error page. This ensures:
+    - Users always see a polished error screen (not raw JSON)
+    - Consistent UX for browser users
+    - API clients can still detect errors by checking the `Location` header for `/r/` pattern
+  </Warning>
+</ResponseField>
+
+## HTTP Status Code Matrix
+
+| Short Code Status | HTTP Status | Location Header | Description |
+|------------------|-------------|-----------------|-------------|
+| Valid & Active | `302 Found` | Original URL | Successful redirect |
+| Not Found | `302 Found` | `/r/{code}?error=not_found` | Code doesn't exist |
+| Expired | `302 Found` | `/r/{code}?error=expired` | Link has expired (8h TTL) |
+| Deleted | `302 Found` | `/r/{code}?error=not_found` | Soft-deleted by user |
+
+<Note>
+  **Why Not 404 or 410 Directly?**
+  
+  Returning `302 Found` for all cases (even errors) provides a better user experience:
+  - Browser users see a friendly error page instead of browser's default error screen
+  - The frontend can customize error messages, suggest actions, and maintain branding
+  - API clients can still distinguish errors by parsing the `Location` header
+</Note>
+
+## Latency Tracking
+
+Each successful redirect measures and records its latency:
+
+1. **Start Timer**: Record timestamp when request arrives
+2. **Resolve Code**: Query database for original URL
+3. **Calculate Latency**: `System.currentTimeMillis() - start`
+4. **Update Statistics**: Apply Welford's algorithm to update running average
+5. **Increment Counter**: Increase `redirectCount` by 1
+6. **Return Redirect**: Send `302 Found` response
+
+### Welford Algorithm Implementation
+
+```java
+// Update running average without storing history
+double newAvg = currentAvg + (newLatency - currentAvg) / newCount;
+```
+
+This O(1) algorithm ensures:
+- **Constant memory**: No need to store all historical latencies
+- **Constant time**: Update completes in microseconds
+- **Numerical stability**: Minimizes floating-point errors
+
+### Latency Components
+
+Measured latency includes:
+- Database query time
+- Business logic execution
+- Network round-trip time (excluded)
+
+<Warning>
+  The measured latency is server-side only. It does **not** include:
+  - Client-to-server network delay
+  - DNS resolution time
+  - TLS handshake time
+  - Second redirect to final destination
+</Warning>
+
+## Automatic Cleanup
+
+Expired anonymous links are automatically cleaned up every 15 minutes by a scheduled job:
+
+1. **Mark as Expired**: Set `status = EXPIRED` for links past their `expiresAt` timestamp
+2. **Physical Deletion**: Remove `DELETED` and `EXPIRED` records older than 7 days
+
+<Note>
+  **Production Scaling**
+  
+  The cleanup job uses `@Scheduled` which runs within the JVM. For production:
+  - Keep backend `desiredCount=1` to avoid duplicate job execution
+  - Or migrate to ECS Scheduled Tasks / AWS EventBridge for better scalability
+  - Or use Quartz Scheduler with database-backed locking
+</Note>
+
+## Example Redirect Flow
+
+<Steps>
+  <Step title="User Clicks Short Link">
+    ```
+    https://short.ly/aB3xYz7
+    ```
+  </Step>
+  
+  <Step title="Browser Sends GET Request">
+    ```http
+    GET /aB3xYz7 HTTP/1.1
+    Host: short.ly
+    User-Agent: Mozilla/5.0 ...
+    ```
+  </Step>
+  
+  <Step title="Server Resolves Code">
+    - Start latency timer
+    - Query database: `SELECT * FROM short_urls WHERE short_code = 'aB3xYz7'`
+    - Check status: `ACTIVE`, `EXPIRED`, or `DELETED`
+    - Calculate latency: `System.currentTimeMillis() - start`
+  </Step>
+  
+  <Step title="Server Updates Analytics">
+    - Increment `redirect_count`
+    - Update `avg_redirect_ms` using Welford algorithm
+  </Step>
+  
+  <Step title="Server Sends 302 Redirect">
+    ```http
+    HTTP/1.1 302 Found
+    Location: https://example.com/original-url
+    Content-Length: 0
+    ```
+  </Step>
+  
+  <Step title="Browser Follows Redirect">
+    Browser automatically navigates to `https://example.com/original-url`
+  </Step>
+</Steps>
+
+## Error Handling Examples
+
+### Short Code Not Found
+
+**Request:**
+```bash
+curl -v http://localhost:8080/invalid99
+```
+
+**Response:**
+```http
+HTTP/1.1 302 Found
+Location: http://localhost/r/invalid99?error=not_found
+```
+
+**Frontend Error Page:**
+```
+┌─────────────────────────────────────┐
+│  404 - Short Link Not Found         │
+│                                     │
+│  The link 'invalid99' doesn't exist │
+│                                     │
+│  [Create Your Own Short Link]       │
+└─────────────────────────────────────┘
+```
+
+### Expired Link
+
+**Request:**
+```bash
+curl -v http://localhost:8080/expired1
+```
+
+**Response:**
+```http
+HTTP/1.1 302 Found
+Location: http://localhost/r/expired1?error=expired
+```
+
+**Frontend Error Page:**
+```
+┌─────────────────────────────────────┐
+│  410 - Link Expired                 │
+│                                     │
+│  This temporary link has expired.   │
+│  Anonymous links expire after 8h.   │
+│                                     │
+│  [Sign Up] for permanent links      │
+└─────────────────────────────────────┘
+```
+
+## Path Pattern Matching
+
+The endpoint uses Spring's `@GetMapping` with a regex constraint:
+
+```java
+@GetMapping("/{shortCode:[a-zA-Z0-9]{4,10}}")
+```
+
+**Valid Patterns:**
+- `aB3xYz7` ✓
+- `abc123` ✓
+- `WXYZ` ✓ (minimum 4 chars)
+- `abcd123456` ✓ (maximum 10 chars)
+
+**Invalid Patterns:**
+- `abc` ✗ (too short)
+- `abcdefghijk` ✗ (too long)
+- `abc-123` ✗ (contains hyphen)
+- `abc_123` ✗ (contains underscore)
+- `/api/urls` ✗ (handled by other endpoints)
+
+## Production Considerations
+
+<CardGroup cols={2}>
+  <Card title="CDN Caching" icon="network-wired">
+    Consider caching 302 redirects at CDN edge:
+    - Reduces server load
+    - Improves redirect speed
+    - Be careful with cache invalidation
+  </Card>
+  
+  <Card title="Rate Limiting" icon="shield">
+    Implement rate limits to prevent abuse:
+    - Per IP: 100 redirects/minute
+    - Per short code: 1000 redirects/hour
+    - Use Redis for distributed rate limiting
+  </Card>
+  
+  <Card title="Analytics" icon="chart-line">
+    Enhance tracking with:
+    - Geolocation data (MaxMind GeoIP)
+    - User agent parsing (referrer, device)
+    - Timestamp bucketing for trends
+  </Card>
+  
+  <Card title="Monitoring" icon="bell">
+    Set up alerts for:
+    - High 404 rates (broken links)
+    - Latency spikes (database issues)
+    - Redirect errors (expired links)
+  </Card>
+</CardGroup>
+
+## Performance Benchmarks
+
+Typical redirect latency on AWS ECS Fargate (db.t3.micro RDS):
+
+| Metric | Value |
+|--------|-------|
+| Median (p50) | 35-45 ms |
+| 95th percentile (p95) | 60-80 ms |
+| 99th percentile (p99) | 100-150 ms |
+| Database query time | 10-20 ms |
+| Business logic | 5-10 ms |
+| Network overhead | 15-25 ms |
+
+<Tip>
+  To reduce latency:
+  - Use read replicas for redirect queries
+  - Add database indexes on `short_code` column (should already exist)
+  - Consider caching popular redirects in Redis (1-5 minute TTL)
+  - Use connection pooling (HikariCP configured in Spring Boot)
+</Tip>

@@ -1,0 +1,289 @@
+---
+title: Statistics
+description: Retrieve platform-wide usage statistics and analytics
+---
+
+The statistics endpoint provides public, read-only access to aggregate platform metrics including total links created, redirect counts, and average latency. This endpoint does not require authentication and is used by the landing page footer.
+
+## Get Platform Statistics
+
+Retrieve live aggregate statistics for the entire platform.
+
+<CodeGroup>
+```bash cURL
+curl -X GET http://localhost:8080/api/stats
+```
+
+```javascript JavaScript
+const response = await fetch('http://localhost:8080/api/stats', {
+  method: 'GET',
+});
+
+const data = await response.json();
+```
+
+```python Python
+import requests
+
+response = requests.get('http://localhost:8080/api/stats')
+data = response.json()
+```
+
+```java Java
+import java.net.http.*;
+import java.net.URI;
+
+HttpClient client = HttpClient.newHttpClient();
+HttpRequest request = HttpRequest.newBuilder()
+    .uri(URI.create("http://localhost:8080/api/stats"))
+    .GET()
+    .build();
+
+HttpResponse<String> response = client.send(request, 
+    HttpResponse.BodyHandlers.ofString());
+```
+</CodeGroup>
+
+### Endpoint
+
+```
+GET /api/stats
+```
+
+### Authentication
+
+<ParamField query="authentication" type="none">
+  This endpoint is **public** and does not require authentication.
+</ParamField>
+
+### Response
+
+<ResponseField name="totalLinks" type="integer">
+  Total number of shortened URLs ever created on the platform (includes both anonymous and authenticated links).
+</ResponseField>
+
+<ResponseField name="totalRedirects" type="integer">
+  Cumulative count of all redirect events across every short URL.
+</ResponseField>
+
+<ResponseField name="avgLatencyMs" type="number | null">
+  Global average redirect latency in milliseconds, rounded to one decimal place.
+  
+  Returns `null` when no redirects have been recorded yet (avoids showing "0 ms" on fresh instances).
+  
+  Calculated using the **Welford online algorithm** for running averages without storing historical data.
+</ResponseField>
+
+### Response Headers
+
+<ResponseField name="Cache-Control" type="string">
+  ```
+  max-age=30, public
+  ```
+  
+  The response is cached for **30 seconds** to prevent database hammering during high traffic. Multiple simultaneous requests within the cache window will receive the same response.
+</ResponseField>
+
+### Status Codes
+
+<ResponseField name="200 OK" type="Success">
+  Statistics successfully retrieved.
+</ResponseField>
+
+<ResponseField name="500 Internal Server Error" type="Error">
+  Database error or service unavailable.
+</ResponseField>
+
+### Example Response
+
+<Tabs>
+  <Tab title="Active Platform">
+    ```json
+    {
+      "totalLinks": 15847,
+      "totalRedirects": 342156,
+      "avgLatencyMs": 42.3
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Fresh Instance">
+    ```json
+    {
+      "totalLinks": 0,
+      "totalRedirects": 0,
+      "avgLatencyMs": null
+    }
+    ```
+    
+    When no data exists yet, `avgLatencyMs` is `null` instead of `0` to distinguish between "no data" and "zero latency".
+  </Tab>
+  
+  <Tab title="New Platform">
+    ```json
+    {
+      "totalLinks": 23,
+      "totalRedirects": 0,
+      "avgLatencyMs": null
+    }
+    ```
+    
+    Links have been created but not yet used. Latency is `null` until the first redirect occurs.
+  </Tab>
+</Tabs>
+
+## Implementation Details
+
+### Latency Calculation
+
+The average latency is calculated using the **Welford online algorithm**, which updates the mean incrementally without storing historical values:
+
+```
+μₙ = μₙ₋₁ + (xₙ − μₙ₋₁) / n
+```
+
+Where:
+- `μₙ` = new average after n measurements
+- `μₙ₋₁` = previous average
+- `xₙ` = new measurement
+- `n` = total number of measurements
+
+This approach is:
+- **Memory efficient**: No need to store all historical latencies
+- **Computationally efficient**: O(1) update time per redirect
+- **Numerically stable**: Minimizes floating-point rounding errors
+
+### Caching Strategy
+
+The endpoint includes a `Cache-Control: max-age=30, public` header to:
+- Reduce database load during traffic spikes
+- Allow CDN/proxy caching for better performance
+- Balance freshness with scalability
+
+Clients can safely cache the response for up to 30 seconds.
+
+### Database Queries
+
+The stats are computed using optimized aggregate queries:
+
+```sql
+-- Total links
+SELECT COUNT(*) FROM short_urls;
+
+-- Total redirects
+SELECT COALESCE(SUM(redirect_count), 0) FROM short_urls;
+
+-- Average latency
+SELECT COALESCE(AVG(avg_redirect_ms), 0) 
+FROM short_urls 
+WHERE redirect_count > 0;
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Landing Page Footer" icon="chart-line">
+    Display real-time platform metrics to build trust and showcase usage.
+  </Card>
+  
+  <Card title="Status Dashboard" icon="gauge">
+    Monitor platform health and performance trends.
+  </Card>
+  
+  <Card title="Marketing Analytics" icon="chart-bar">
+    Track growth metrics for business reporting.
+  </Card>
+  
+  <Card title="Public API" icon="globe">
+    Provide transparency to users about platform scale.
+  </Card>
+</CardGroup>
+
+## Performance Considerations
+
+<Warning>
+  **High Traffic Scenarios**
+  
+  On platforms with millions of links:
+  - Consider using materialized views for aggregate queries
+  - Implement Redis caching for even longer cache durations
+  - Use read replicas to offload analytics queries from the primary database
+</Warning>
+
+<Note>
+  **Real-Time Updates**
+  
+  Due to the 30-second cache, statistics may be slightly delayed. For near real-time dashboards, consider:
+  - Reducing cache duration (at the cost of database load)
+  - Using WebSocket connections for live updates
+  - Implementing server-sent events (SSE) for streaming stats
+</Note>
+
+## Example Integration
+
+### React Hook
+
+```javascript
+import { useEffect, useState } from 'react';
+
+export function useStats() {
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const fetchStats = async () => {
+      try {
+        const response = await fetch('http://localhost:8080/api/stats');
+        if (!response.ok) throw new Error('Failed to fetch stats');
+        const data = await response.json();
+        setStats(data);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchStats();
+    
+    // Refresh every 30 seconds to align with cache
+    const interval = setInterval(fetchStats, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return { stats, loading, error };
+}
+```
+
+### Display Component
+
+```javascript
+import { useStats } from './hooks/useStats';
+
+export function StatsFooter() {
+  const { stats, loading, error } = useStats();
+
+  if (loading) return <div>Loading statistics...</div>;
+  if (error) return <div>Error: {error}</div>;
+
+  return (
+    <footer className="stats-footer">
+      <div>
+        <span className="label">Total Links:</span>
+        <span className="value">{stats.totalLinks.toLocaleString()}</span>
+      </div>
+      <div>
+        <span className="label">Total Redirects:</span>
+        <span className="value">{stats.totalRedirects.toLocaleString()}</span>
+      </div>
+      {stats.avgLatencyMs !== null && (
+        <div>
+          <span className="label">Avg Latency:</span>
+          <span className="value">{stats.avgLatencyMs} ms</span>
+        </div>
+      )}
+    </footer>
+  );
+}
+```

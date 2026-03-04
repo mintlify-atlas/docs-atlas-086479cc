@@ -1,0 +1,610 @@
+---
+title: HTTPS and SSL/TLS Configuration
+description: Request and configure AWS Certificate Manager (ACM) certificates for secure HTTPS access
+---
+
+Securing your ADMA application with HTTPS is essential for production deployments. AWS Certificate Manager (ACM) provides free SSL/TLS certificates with automatic renewal.
+
+## Prerequisites
+
+Before requesting an ACM certificate:
+
+- **Domain name**: You must own a domain name (e.g., `example.com`)
+- **DNS access**: Ability to create DNS records for domain validation
+- **ALB created**: Your Application Load Balancer must exist
+
+<Info>
+ACM certificates are **free** and automatically renew. You only pay for the resources using them (ALB).
+</Info>
+
+## Certificate Strategy
+
+For the ADMA application, request a certificate that covers both your main domain and subdomains:
+
+- **Primary domain**: `example.com` (frontend)
+- **API subdomain**: `api.example.com` (backend)
+- **Short URL subdomain**: `go.example.com` (redirect domain)
+
+Use a wildcard certificate or list specific SANs (Subject Alternative Names).
+
+## Request ACM Certificate
+
+<Steps>
+
+### Choose Validation Method
+
+ACM supports two validation methods:
+
+- **DNS validation** (recommended): Add a CNAME record to prove ownership
+- **Email validation**: Receive validation emails at admin addresses
+
+<Warning>
+Use **DNS validation** for automated renewals. Email validation requires manual intervention every 13 months.
+</Warning>
+
+### Request Wildcard Certificate
+
+```bash
+export DOMAIN="example.com"  # Replace with your domain
+
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name $DOMAIN \
+  --subject-alternative-names "*.$DOMAIN" \
+  --validation-method DNS \
+  --region $AWS_REGION \
+  --query 'CertificateArn' \
+  --output text)
+
+echo "Certificate ARN: $CERT_ARN"
+```
+
+This creates a certificate valid for:
+- `example.com`
+- `*.example.com` (all subdomains)
+
+### Request Certificate with Specific Domains
+
+Alternatively, list specific domains:
+
+```bash
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name $DOMAIN \
+  --subject-alternative-names "api.$DOMAIN" "go.$DOMAIN" "www.$DOMAIN" \
+  --validation-method DNS \
+  --region $AWS_REGION \
+  --query 'CertificateArn' \
+  --output text)
+```
+
+### Get Validation Records
+
+Retrieve the DNS records you need to create:
+
+```bash
+aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --region $AWS_REGION \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord' \
+  --output table
+```
+
+Expected output:
+```
+----------------------------------------------------------------------
+|                      DescribeCertificate                           |
++------------+-------------------------------------------------------+
+|    Name    |  _abc123.example.com                                 |
+|    Type    |  CNAME                                               |
+|    Value   |  _xyz456.acm-validations.aws.                        |
++------------+-------------------------------------------------------+
+```
+
+</Steps>
+
+## DNS Validation
+
+### Validate with Route 53 (Automatic)
+
+If your domain uses Route 53, ACM can create validation records automatically:
+
+<Steps>
+
+### Get Hosted Zone ID
+
+```bash
+HOSTED_ZONE_ID=$(aws route53 list-hosted-zones \
+  --query "HostedZones[?Name=='$DOMAIN.'].Id" \
+  --output text | cut -d'/' -f3)
+
+echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+```
+
+### Create Validation Records Automatically
+
+```bash
+# Get validation record details
+VALIDATION_RECORD=$(aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --region $AWS_REGION \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord' \
+  --output json)
+
+RECORD_NAME=$(echo $VALIDATION_RECORD | jq -r '.Name')
+RECORD_VALUE=$(echo $VALIDATION_RECORD | jq -r '.Value')
+
+# Create the CNAME record
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "'$RECORD_NAME'",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "'$RECORD_VALUE'"}]
+      }
+    }]
+  }'
+```
+
+### Wait for Validation
+
+Validation typically completes within 5-30 minutes:
+
+```bash
+aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --region $AWS_REGION \
+  --query 'Certificate.Status' \
+  --output text
+```
+
+Wait until the status changes from `PENDING_VALIDATION` to `ISSUED`.
+
+</Steps>
+
+### Validate with External DNS Provider
+
+If you use a different DNS provider (Cloudflare, GoDaddy, Namecheap, etc.):
+
+<Steps>
+
+### Get Validation Record Details
+
+```bash
+aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --region $AWS_REGION \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord'
+```
+
+### Add CNAME Record Manually
+
+In your DNS provider's control panel:
+
+| Field | Value |
+|-------|-------|
+| **Type** | CNAME |
+| **Name** | `_abc123.example.com` (from ACM output) |
+| **Value** | `_xyz456.acm-validations.aws.` (from ACM output) |
+| **TTL** | 300 (5 minutes) |
+
+<Warning>
+Some DNS providers require you to enter only the subdomain part (e.g., `_abc123`) without the domain name.
+</Warning>
+
+### Verify DNS Propagation
+
+```bash
+dig _abc123.example.com CNAME +short
+```
+
+Should return the ACM validation value.
+
+### Wait for ACM to Validate
+
+ACM automatically checks DNS records every few minutes. Once validated, the certificate status changes to `ISSUED`.
+
+</Steps>
+
+## Configure ALB to Use Certificate
+
+### Update Existing HTTPS Listener
+
+If you created an HTTPS listener without a certificate:
+
+```bash
+# Get listener ARN
+LISTENER_ARN=$(aws elbv2 describe-listeners \
+  --load-balancer-arn $ALB_ARN \
+  --query 'Listeners[?Port==`443`].ListenerArn' \
+  --output text \
+  --region $AWS_REGION)
+
+# Add certificate
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS-1-2-2017-01 \
+  --region $AWS_REGION
+```
+
+### Create New HTTPS Listener
+
+If you only have an HTTP listener:
+
+```bash
+# Delete temporary HTTP listener on port 80 if it forwards traffic
+OLD_LISTENER=$(aws elbv2 describe-listeners \
+  --load-balancer-arn $ALB_ARN \
+  --query 'Listeners[?Port==`80` && DefaultActions[0].Type==`forward`].ListenerArn' \
+  --output text)
+
+if [ ! -z "$OLD_LISTENER" ]; then
+  aws elbv2 delete-listener --listener-arn $OLD_LISTENER --region $AWS_REGION
+fi
+
+# Create HTTP to HTTPS redirect
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}" \
+  --region $AWS_REGION
+
+# Create HTTPS listener
+LISTENER_ARN=$(aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS-1-2-2017-01 \
+  --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN \
+  --region $AWS_REGION \
+  --query 'Listeners[0].ListenerArn' \
+  --output text)
+
+echo "HTTPS Listener ARN: $LISTENER_ARN"
+```
+
+### Add Routing Rules to HTTPS Listener
+
+Re-create the routing rules if you created a new listener:
+
+```bash
+# Route /api/* to backend
+aws elbv2 create-rule \
+  --listener-arn $LISTENER_ARN \
+  --priority 10 \
+  --conditions Field=path-pattern,Values="/api/*" \
+  --actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN \
+  --region $AWS_REGION
+
+# Route short codes to backend
+aws elbv2 create-rule \
+  --listener-arn $LISTENER_ARN \
+  --priority 20 \
+  --conditions Field=path-pattern,Values="/???????" \
+  --actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN \
+  --region $AWS_REGION
+```
+
+## Configure DNS for Your Domain
+
+### Point Domain to ALB
+
+Create DNS records pointing to your ALB:
+
+<CodeGroup>
+
+```bash Route 53
+# Create A record for root domain
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "'$DOMAIN'",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "'$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)'",
+          "DNSName": "'$ALB_DNS'",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'
+
+# Create A record for api subdomain
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "api.'$DOMAIN'",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "'$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)'",
+          "DNSName": "'$ALB_DNS'",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'
+
+# Create A record for go subdomain (short URLs)
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "go.'$DOMAIN'",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "'$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)'",
+          "DNSName": "'$ALB_DNS'",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'
+```
+
+```text External DNS Provider
+Manually create A or CNAME records:
+
+Record 1:
+  Type: CNAME
+  Name: @
+  Value: adma-alb-123456789.eu-west-1.elb.amazonaws.com
+  TTL: 300
+
+Record 2:
+  Type: CNAME
+  Name: api
+  Value: adma-alb-123456789.eu-west-1.elb.amazonaws.com
+  TTL: 300
+
+Record 3:
+  Type: CNAME
+  Name: go
+  Value: adma-alb-123456789.eu-west-1.elb.amazonaws.com
+  TTL: 300
+```
+
+</CodeGroup>
+
+<Info>
+Route 53 **Alias records** are preferred over CNAME for root domains and provide better performance (no additional DNS lookup).
+</Info>
+
+## SSL/TLS Security Policies
+
+### Recommended Policy
+
+The default policy `ELBSecurityPolicy-TLS-1-2-2017-01` supports:
+
+- **TLS 1.2** and **TLS 1.3**
+- Modern cipher suites
+- Perfect Forward Secrecy (PFS)
+
+### Available Policies
+
+List available SSL policies:
+
+```bash
+aws elbv2 describe-ssl-policies \
+  --query 'SslPolicies[].Name' \
+  --output table \
+  --region $AWS_REGION
+```
+
+### Stricter Policy (TLS 1.3 Only)
+
+For maximum security:
+
+```bash
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --region $AWS_REGION
+```
+
+<Warning>
+Stricter policies may not work with older browsers. Test thoroughly before deploying to production.
+</Warning>
+
+## Test HTTPS Configuration
+
+<Steps>
+
+### Test Certificate
+
+Verify the certificate is installed correctly:
+
+```bash
+openssl s_client -connect $DOMAIN:443 -servername $DOMAIN < /dev/null
+```
+
+Look for:
+```
+Subject: CN=example.com
+Issuer: CN=Amazon, OU=Server CA 1B, O=Amazon, C=US
+Verify return code: 0 (ok)
+```
+
+### Test HTTP to HTTPS Redirect
+
+```bash
+curl -I http://$DOMAIN
+```
+
+Expected response:
+```http
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/
+```
+
+### Test Application Access
+
+```bash
+# Test frontend
+curl -I https://$DOMAIN
+
+# Test backend API
+curl https://api.$DOMAIN/api/stats
+
+# Test short URL
+curl -I https://go.$DOMAIN/abc1234
+```
+
+### SSL Labs Test
+
+Run a comprehensive SSL test:
+
+```
+https://www.ssllabs.com/ssltest/analyze.html?d=example.com
+```
+
+Target grade: **A** or **A+**
+
+</Steps>
+
+## Update Application Configuration
+
+Update environment variables in your ECS task definitions:
+
+### Backend Task Definition
+
+Update these values in `infrastructure/task-def-backend.json`:
+
+```json
+{
+  "environment": [
+    {
+      "name": "APP_BASE_URL",
+      "value": "https://go.example.com"  // Short URL domain
+    },
+    {
+      "name": "CORS_ALLOWED_ORIGINS",
+      "value": "https://example.com,https://www.example.com"  // Frontend domains
+    }
+  ]
+}
+```
+
+Register the updated task definition and update the service:
+
+```bash
+aws ecs register-task-definition \
+  --cli-input-json file://infrastructure/task-def-backend.json \
+  --region $AWS_REGION
+
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --task-definition adma-backend:2 \
+  --force-new-deployment \
+  --region $AWS_REGION
+```
+
+### Frontend Rebuild
+
+Rebuild and push the frontend with the HTTPS API URL:
+
+```bash
+cd frontend
+
+docker build \
+  --build-arg VITE_API_BASE_URL=https://api.$DOMAIN \
+  -t $ECR_BASE/adma/frontend:latest \
+  .
+
+docker push $ECR_BASE/adma/frontend:latest
+
+# Force ECS to pull new image
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-frontend \
+  --force-new-deployment \
+  --region $AWS_REGION
+```
+
+## Certificate Renewal
+
+ACM certificates **automatically renew** before expiration:
+
+- **Renewal attempt**: 60 days before expiration
+- **DNS validation**: Must remain valid for automatic renewal
+- **No action required** if DNS validation records exist
+
+### Monitor Certificate Expiration
+
+Set up a CloudWatch alarm:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name adma-cert-expiring \
+  --alarm-description "Alert when ACM certificate is expiring" \
+  --metric-name DaysToExpiry \
+  --namespace AWS/CertificateManager \
+  --statistic Minimum \
+  --period 86400 \
+  --evaluation-periods 1 \
+  --threshold 30 \
+  --comparison-operator LessThanThreshold \
+  --dimensions Name=CertificateArn,Value=$CERT_ARN \
+  --region $AWS_REGION
+```
+
+## Troubleshooting
+
+### Certificate Stuck in PENDING_VALIDATION
+
+**Cause**: DNS validation record not found
+
+**Solution**: 
+1. Verify the CNAME record is created correctly
+2. Check DNS propagation: `dig _abc123.example.com CNAME`
+3. Ensure you used the exact name and value from ACM
+
+### NET::ERR_CERT_COMMON_NAME_INVALID
+
+**Cause**: Certificate doesn't cover the domain you're accessing
+
+**Solution**: Request a new certificate with the correct domain/SANs
+
+### Mixed Content Warnings
+
+**Cause**: Frontend loading HTTP resources over HTTPS
+
+**Solution**: Ensure all resources (scripts, images) use HTTPS URLs or relative paths
+
+### CORS Errors After HTTPS
+
+**Cause**: CORS configuration still allows HTTP origins
+
+**Solution**: Update `CORS_ALLOWED_ORIGINS` to use HTTPS URLs
+
+## Security Best Practices
+
+- ✅ Use TLS 1.2 or higher (disable TLS 1.0/1.1)
+- ✅ Enable HTTP Strict Transport Security (HSTS)
+- ✅ Use wildcard certificates sparingly
+- ✅ Rotate certificates annually (ACM does this automatically)
+- ✅ Monitor certificate expiration
+- ✅ Test SSL configuration with SSL Labs
+
+## Next Steps
+
+With HTTPS configured:
+
+1. Enable security headers (HSTS, CSP, X-Frame-Options)
+2. Set up CloudWatch monitoring and alarms
+3. Configure auto-scaling for ECS services
+4. Implement CI/CD for automated deployments
+5. Create production database backups

@@ -1,0 +1,367 @@
+---
+title: Environment Variables
+description: Complete reference of all backend and frontend environment variables for the ADMA Cloud URL Shortener
+---
+
+The ADMA Cloud URL Shortener uses environment variables to configure both the backend (Spring Boot) and frontend (React + Vite) components. This page provides a complete reference of all configuration options.
+
+## Backend Environment Variables
+
+Backend environment variables are injected at **runtime** via the ECS Task Definition or Docker Compose configuration.
+
+### Database Configuration
+
+<Note>
+These variables configure the PostgreSQL database connection. In production, they should point to your AWS RDS instance.
+</Note>
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DB_HOST` | Yes | `localhost` | PostgreSQL server hostname or IP address. In AWS, use your RDS endpoint (e.g., `my-rds.xxxxx.eu-west-1.rds.amazonaws.com`) |
+| `DB_PORT` | Yes | `5432` | PostgreSQL server port |
+| `DB_NAME` | Yes | `urlshortener` | Name of the database to connect to |
+| `DB_USERNAME` | Yes | `postgres` | Database user for authentication |
+| `DB_PASSWORD` | Yes | `changeme` | Database password for authentication |
+
+<Warning>
+**Security Best Practice**: Never hardcode `DB_PASSWORD` in your configuration files. In AWS, store it in **AWS Systems Manager Parameter Store** or **Secrets Manager** as a `SecureString` and reference it in your ECS Task Definition.
+</Warning>
+
+**Example (Production - AWS RDS)**:
+```bash
+DB_HOST=adma-postgres.c12ab3xyz456.eu-west-1.rds.amazonaws.com
+DB_PORT=5432
+DB_NAME=urlshortener
+DB_USERNAME=appuser
+DB_PASSWORD=<stored-in-ssm-parameter-store>
+```
+
+### JWT Configuration
+
+<Note>
+JSON Web Tokens (JWT) are used for stateless authentication. The secret key must be at least 32 characters for HS256 signing.
+</Note>
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `JWT_SECRET` | Yes | `changeme-this-must-be-at-least-32-chars-long!!` | Secret key used to sign and verify JWT tokens. **Must be at least 32 characters** for HS256 algorithm |
+| `JWT_EXPIRATION_MS` | No | `86400000` | Token expiration time in milliseconds. Default is 24 hours (86400000 ms) |
+
+<Warning>
+**Critical Security Requirement**: 
+- `JWT_SECRET` must be a strong, randomly generated string of at least 32 characters
+- Store it in AWS SSM Parameter Store as a `SecureString` in production
+- Never commit the production secret to version control
+- Generate a new secret: `openssl rand -base64 48`
+</Warning>
+
+**Example (Production)**:
+```bash
+JWT_SECRET=<stored-in-ssm-parameter-store>
+JWT_EXPIRATION_MS=86400000  # 24 hours
+```
+
+### Application URLs
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `APP_BASE_URL` | Yes | `""` (empty string) | Base URL used when constructing fully-qualified short URLs returned in API responses. Must include protocol (e.g., `https://go.yourdomain.com`). If empty, falls back to the request's context path |
+| `FRONTEND_URL` | No | `http://localhost` | Frontend application URL, used by the backend to construct redirect URLs to the SPA error pages |
+
+<Info>
+When `APP_BASE_URL` is not set, the backend will dynamically resolve the base URL from the incoming HTTP request. In production behind an ALB, you should explicitly set this to ensure consistent short URLs.
+</Info>
+
+**Example (Production)**:
+```bash
+APP_BASE_URL=https://go.yourdomain.com
+FRONTEND_URL=https://yourdomain.com
+```
+
+### CORS Configuration
+
+<Note>
+Cross-Origin Resource Sharing (CORS) must be configured to allow the frontend to communicate with the backend API.
+</Note>
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CORS_ALLOWED_ORIGINS` | Yes | `http://localhost,http://localhost:3000,http://localhost:5173` | Comma-separated list of allowed origins for CORS requests. In production, set this to your frontend domain(s) only |
+
+**Example (Development)**:
+```bash
+CORS_ALLOWED_ORIGINS=http://localhost,http://localhost:3000,http://localhost:5173
+```
+
+**Example (Production)**:
+```bash
+CORS_ALLOWED_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+```
+
+<Warning>
+**Security Warning**: Never use wildcard `*` in production. Only whitelist your actual frontend domain(s).
+</Warning>
+
+### Server Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SERVER_PORT` | No | `8080` | Port on which the Spring Boot application listens for HTTP requests |
+
+**Example**:
+```bash
+SERVER_PORT=8080
+```
+
+### Connection Pool Settings
+
+<Info>
+HikariCP connection pool settings are configured in `application.yml` and can be overridden via environment variables if needed.
+</Info>
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Maximum Pool Size | `10` | Maximum number of connections in the pool |
+| Minimum Idle | `2` | Minimum number of idle connections maintained |
+| Connection Timeout | `30000` ms | Maximum time to wait for a connection from the pool |
+
+These are currently hardcoded in `application.yml` but can be externalized if needed for production tuning.
+
+---
+
+## Frontend Environment Variables
+
+<Warning>
+**Critical Difference**: Frontend environment variables are **build-time** only. They are baked into the JavaScript bundle during the Docker image build and **cannot be changed at runtime**.
+</Warning>
+
+### Build-Time Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `VITE_API_BASE_URL` | Yes | `""` (empty string) | Base URL of the backend API. This value is embedded into the compiled JavaScript bundle at build time. Must include protocol (e.g., `https://api.yourdomain.com`) |
+
+<Info>
+**How It Works**:
+- Vite reads `VITE_API_BASE_URL` from the environment **during the build process**
+- The value is replaced in the code via `import.meta.env.VITE_API_BASE_URL`
+- The final JavaScript bundle contains the hardcoded URL
+- This is accessed in `frontend/src/lib/api.ts:32`
+</Info>
+
+### Setting Frontend Environment Variables
+
+#### Local Development
+
+Create a `.env.local` file in the `frontend/` directory:
+
+```bash
+# frontend/.env.local
+VITE_API_BASE_URL=http://localhost:8080
+```
+
+#### Docker Build
+
+Pass as a build argument when building the Docker image:
+
+```bash
+docker build \
+  --build-arg VITE_API_BASE_URL=https://api.yourdomain.com \
+  -t frontend:latest \
+  ./frontend
+```
+
+#### Docker Compose
+
+Specified in the `docker-compose.yml` file:
+
+```yaml
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+```
+
+#### AWS ECS / CI/CD
+
+In your GitHub Actions or CI/CD pipeline:
+
+```yaml
+- name: Build frontend image
+  run: |
+    docker build \
+      --build-arg VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }} \
+      -t $ECR_REGISTRY/frontend:latest \
+      ./frontend
+```
+
+<Warning>
+**Important**: You must know your production backend URL **before building the frontend image**. If you need to change the API URL, you must rebuild and redeploy the frontend image.
+</Warning>
+
+---
+
+## Environment Variable Summary
+
+### Backend (Runtime Configuration)
+
+<Accordion title="Complete Backend Environment Variables">
+
+```bash
+# Database
+DB_HOST=my-rds.xxxxx.eu-west-1.rds.amazonaws.com
+DB_PORT=5432
+DB_NAME=urlshortener
+DB_USERNAME=appuser
+DB_PASSWORD=<secret>
+
+# JWT
+JWT_SECRET=<secret-at-least-32-chars>
+JWT_EXPIRATION_MS=86400000
+
+# Application URLs
+APP_BASE_URL=https://go.yourdomain.com
+FRONTEND_URL=https://yourdomain.com
+
+# CORS
+CORS_ALLOWED_ORIGINS=https://yourdomain.com
+
+# Server
+SERVER_PORT=8080
+```
+
+</Accordion>
+
+### Frontend (Build-Time Configuration)
+
+<Accordion title="Complete Frontend Build Arguments">
+
+```bash
+# API Base URL (embedded at build time)
+VITE_API_BASE_URL=https://api.yourdomain.com
+```
+
+</Accordion>
+
+---
+
+## AWS ECS Task Definition Example
+
+<Accordion title="Backend Task Definition Snippet">
+
+```json
+{
+  "family": "adma-backend",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:latest",
+      "environment": [
+        { "name": "DB_HOST", "value": "adma-postgres.xxxxx.eu-west-1.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_NAME", "value": "urlshortener" },
+        { "name": "DB_USERNAME", "value": "appuser" },
+        { "name": "APP_BASE_URL", "value": "https://go.yourdomain.com" },
+        { "name": "CORS_ALLOWED_ORIGINS", "value": "https://yourdomain.com" },
+        { "name": "SERVER_PORT", "value": "8080" },
+        { "name": "JWT_EXPIRATION_MS", "value": "86400000" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT:parameter/adma/prod/DB_PASSWORD"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT:parameter/adma/prod/JWT_SECRET"
+        }
+      ]
+    }
+  ]
+}
+```
+
+</Accordion>
+
+---
+
+## Validation and Troubleshooting
+
+### Backend Startup Validation
+
+The backend validates critical environment variables on startup:
+
+<Accordion title="Common Startup Errors">
+
+**Error**: `The specified key byte array is X bits which is not secure enough for any JWT HMAC-SHA algorithm`
+
+**Cause**: `JWT_SECRET` is shorter than 32 characters (256 bits required for HS256)
+
+**Solution**: Generate a stronger secret:
+```bash
+openssl rand -base64 48
+```
+
+**Error**: `Connection refused` or `could not connect to server`
+
+**Cause**: Database connection parameters are incorrect or database is unreachable
+
+**Solution**: Verify `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, and `DB_PASSWORD`
+
+**Error**: `Access denied for user`
+
+**Cause**: Invalid database credentials
+
+**Solution**: Check `DB_USERNAME` and `DB_PASSWORD`
+
+</Accordion>
+
+### Frontend Build Validation
+
+<Accordion title="Frontend Build Issues">
+
+**Issue**: API calls fail with CORS errors
+
+**Cause**: `CORS_ALLOWED_ORIGINS` on backend doesn't include frontend origin
+
+**Solution**: Add frontend URL to backend's `CORS_ALLOWED_ORIGINS`
+
+**Issue**: API calls go to wrong URL
+
+**Cause**: `VITE_API_BASE_URL` was set incorrectly during build
+
+**Solution**: Rebuild the frontend image with correct `VITE_API_BASE_URL`
+
+**Issue**: `VITE_API_BASE_URL` is undefined
+
+**Cause**: Build argument wasn't passed to Docker build
+
+**Solution**: Add `--build-arg VITE_API_BASE_URL=<url>` to docker build command
+
+</Accordion>
+
+---
+
+## Security Best Practices
+
+<Warning>
+**Production Security Checklist**:
+
+- Store `JWT_SECRET` and `DB_PASSWORD` in AWS SSM Parameter Store or Secrets Manager
+- Use IAM roles for ECS tasks to access secrets (principle of least privilege)
+- Rotate `JWT_SECRET` periodically (requires invalidating all existing tokens)
+- Use strong, randomly generated passwords for database
+- Enable RDS encryption at rest
+- Never log sensitive environment variables
+- Use HTTPS for all production URLs
+- Restrict `CORS_ALLOWED_ORIGINS` to production frontend domain only
+- Enable VPC security groups to isolate RDS from internet
+</Warning>
+
+## Related Documentation
+
+- [Business Rules](/api/business-rules) - Application business logic and behaviors
+- [API Authentication](/api/authentication) - Authentication endpoints
+- [Deployment Guide](/deployment/aws-setup) - AWS infrastructure setup

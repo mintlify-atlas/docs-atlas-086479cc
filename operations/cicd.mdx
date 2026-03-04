@@ -1,0 +1,670 @@
+---
+title: CI/CD Pipeline
+description: Automated deployments to AWS ECS using GitHub Actions, ECR image management, and rollback procedures
+---
+
+Automate your ADMA URL shortener deployments with GitHub Actions, building and pushing Docker images to Amazon ECR, and deploying to ECS Fargate.
+
+## Overview
+
+The CI/CD pipeline automates:
+
+1. **Build**: Docker images for frontend and backend
+2. **Push**: Images to Amazon ECR with commit SHA tags
+3. **Deploy**: Update ECS services with new task definitions
+4. **Verify**: Wait for service stability before completing
+
+## GitHub Actions Workflow
+
+Create `.github/workflows/deploy.yml` in your repository:
+
+```yaml .github/workflows/deploy.yml
+name: Build & Deploy to AWS ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-1.amazonaws.com
+  BACKEND_IMAGE: adma/backend
+  FRONTEND_IMAGE: adma/frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Para OIDC (recomendado sobre access keys)
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$BACKEND_IMAGE:${{ github.sha }} \
+            -t $ECR_REGISTRY/$BACKEND_IMAGE:latest \
+            ./backend
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:${{ github.sha }}
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:latest
+
+      - name: Build & push frontend
+        run: |
+          docker build \
+            --build-arg VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }} \
+            -t $ECR_REGISTRY/$FRONTEND_IMAGE:${{ github.sha }} \
+            -t $ECR_REGISTRY/$FRONTEND_IMAGE:latest \
+            ./frontend
+          docker push $ECR_REGISTRY/$FRONTEND_IMAGE:${{ github.sha }}
+          docker push $ECR_REGISTRY/$FRONTEND_IMAGE:latest
+
+      - name: Deploy backend to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: infrastructure/task-def-backend.json
+          service: adma-backend
+          cluster: adma-cluster
+          wait-for-service-stability: true
+
+      - name: Deploy frontend to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: infrastructure/task-def-frontend.json
+          service: adma-frontend
+          cluster: adma-cluster
+          wait-for-service-stability: true
+```
+
+## GitHub Secrets Configuration
+
+Configure the following secrets in your GitHub repository (Settings → Secrets → Actions):
+
+| Secret | Description | Example |
+|--------|-------------|----------|
+| `AWS_ACCOUNT_ID` | Your 12-digit AWS account ID | `123456789012` |
+| `VITE_API_BASE_URL` | Backend API URL (baked into frontend bundle at build time) | `https://api.yourdomain.com` |
+
+<Warning>
+**Critical**: `VITE_API_BASE_URL` is a **build-time** variable, not a runtime environment variable. It cannot be changed after the Docker image is built.
+</Warning>
+
+## AWS Authentication Methods
+
+### Option 1: OIDC (Recommended)
+
+Use OpenID Connect for secure, keyless authentication:
+
+<Steps>
+  <Step title="Create IAM Identity Provider">
+    ```bash
+    aws iam create-open-id-connect-provider \
+      --url https://token.actions.githubusercontent.com \
+      --client-id-list sts.amazonaws.com \
+      --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+    ```
+  </Step>
+
+  <Step title="Create IAM Role">
+    Create `github-actions-role` with trust policy:
+
+    ```json trust-policy.json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+            },
+            "StringLike": {
+              "token.actions.githubusercontent.com:sub": "repo:your-org/your-repo:*"
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+    ```bash
+    aws iam create-role \
+      --role-name github-actions-role \
+      --assume-role-policy-document file://trust-policy.json
+    ```
+  </Step>
+
+  <Step title="Attach Permissions">
+    Attach necessary policies:
+
+    ```bash
+    aws iam attach-role-policy \
+      --role-name github-actions-role \
+      --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+    aws iam attach-role-policy \
+      --role-name github-actions-role \
+      --policy-arn arn:aws:iam::aws:policy/AmazonECS_FullAccess
+    ```
+  </Step>
+</Steps>
+
+### Option 2: Access Keys (Less Secure)
+
+Alternatively, use IAM access keys:
+
+```yaml GitHub Actions Step
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    aws-region: ${{ env.AWS_REGION }}
+```
+
+Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as GitHub secrets.
+
+<Note>
+OIDC is preferred because it:
+- Eliminates long-lived credentials
+- Automatically rotates tokens
+- Provides better audit trails
+- Follows AWS security best practices
+</Note>
+
+## ECR Repository Setup
+
+Create ECR repositories for your images:
+
+```bash
+REGION="eu-west-1"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Create backend repository
+aws ecr create-repository \
+  --repository-name adma/backend \
+  --region $REGION \
+  --image-scanning-configuration scanOnPush=true
+
+# Create frontend repository
+aws ecr create-repository \
+  --repository-name adma/frontend \
+  --region $REGION \
+  --image-scanning-configuration scanOnPush=true
+
+echo "ECR base URL: $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+```
+
+<Tip>
+Enable `scanOnPush=true` to automatically scan images for vulnerabilities using Amazon ECR image scanning.
+</Tip>
+
+## Image Tagging Strategy
+
+The workflow tags images with both `latest` and the Git commit SHA:
+
+```bash
+docker build \
+  -t $ECR_REGISTRY/$BACKEND_IMAGE:${{ github.sha }} \
+  -t $ECR_REGISTRY/$BACKEND_IMAGE:latest \
+  ./backend
+```
+
+**Benefits**:
+- `latest`: Always points to the most recent build
+- `{commit-sha}`: Immutable reference for rollbacks and auditing
+
+<Accordion title="Example Tags">
+```
+123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:latest
+123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:a1b2c3d
+123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/frontend:latest
+123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/frontend:a1b2c3d
+```
+</Accordion>
+
+## Task Definition Management
+
+### Storing Task Definitions
+
+Store task definitions as JSON files in your repository:
+
+```
+infrastructure/
+├── task-def-backend.json
+└── task-def-frontend.json
+```
+
+<Accordion title="Example: task-def-backend.json">
+```json infrastructure/task-def-backend.json
+{
+  "family": "adma-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "hostPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "DB_HOST", "value": "adma-postgres.xxxxx.eu-west-1.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_NAME", "value": "urlshortener" },
+        { "name": "DB_USERNAME", "value": "appuser" },
+        { "name": "APP_BASE_URL", "value": "https://go.yourdomain.com" },
+        { "name": "CORS_ALLOWED_ORIGINS", "value": "https://yourdomain.com" },
+        { "name": "SERVER_PORT", "value": "8080" },
+        { "name": "JWT_EXPIRATION_MS", "value": "86400000" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT_ID:parameter/adma/prod/DB_PASSWORD"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:ssm:eu-west-1:ACCOUNT_ID:parameter/adma/prod/JWT_SECRET"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/adma-backend",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "backend"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/actuator/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
+```
+</Accordion>
+
+### Updating Task Definitions
+
+The `amazon-ecs-deploy-task-definition` action:
+1. Reads the task definition JSON
+2. Registers a new revision
+3. Updates the ECS service to use the new revision
+4. Waits for the service to stabilize
+
+## Deployment Process
+
+### Step-by-Step Flow
+
+<Steps>
+  <Step title="Trigger">
+    Push to `main` branch triggers the workflow
+  </Step>
+
+  <Step title="Build Images">
+    Docker builds frontend and backend images in parallel
+  </Step>
+
+  <Step title="Push to ECR">
+    Images are pushed with both `latest` and commit SHA tags
+  </Step>
+
+  <Step title="Deploy Backend">
+    ECS updates backend service with new task definition
+  </Step>
+
+  <Step title="Deploy Frontend">
+    ECS updates frontend service with new task definition
+  </Step>
+
+  <Step title="Verify Stability">
+    Workflow waits for ECS services to reach steady state
+  </Step>
+</Steps>
+
+### Deployment Configuration
+
+ECS services are configured with:
+
+```hcl infrastructure/terraform/modules/ecs/main.tf
+resource "aws_ecs_service" "backend" {
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 50
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+}
+```
+
+<Accordion title="Deployment Parameters Explained">
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Maximum percent** | 200% | Allows 2x desired count during deployments (for blue-green) |
+| **Minimum healthy percent** | 50% | At least 50% of tasks must remain healthy |
+| **Circuit breaker** | Enabled | Automatically rolls back failed deployments |
+</Accordion>
+
+## Manual Deployments
+
+You can also deploy manually using the AWS CLI.
+
+### Build and Push Images
+
+```bash
+REGION="eu-west-1"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_BASE="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+
+# Login to ECR
+aws ecr get-login-password --region $REGION \
+  | docker login --username AWS --password-stdin $ECR_BASE
+
+# Build and push backend
+cd backend
+docker build \
+  -t $ECR_BASE/adma/backend:latest \
+  -t $ECR_BASE/adma/backend:$(git rev-parse --short HEAD) \
+  .
+docker push $ECR_BASE/adma/backend:latest
+docker push $ECR_BASE/adma/backend:$(git rev-parse --short HEAD)
+
+# Build and push frontend
+cd ../frontend
+docker build \
+  --build-arg VITE_API_BASE_URL=https://api.yourdomain.com \
+  -t $ECR_BASE/adma/frontend:latest \
+  -t $ECR_BASE/adma/frontend:$(git rev-parse --short HEAD) \
+  .
+docker push $ECR_BASE/adma/frontend:latest
+docker push $ECR_BASE/adma/frontend:$(git rev-parse --short HEAD)
+```
+
+### Force New Deployment
+
+```bash
+# Deploy backend with latest image
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --force-new-deployment \
+  --region eu-west-1
+
+# Deploy frontend with latest image
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-frontend \
+  --force-new-deployment \
+  --region eu-west-1
+```
+
+<Tip>
+`--force-new-deployment` stops running tasks and starts new ones with the latest task definition, even if nothing changed.
+</Tip>
+
+## Rollback Procedures
+
+If a deployment causes issues, roll back to a previous version.
+
+### Method 1: Rollback to Previous Task Definition
+
+```bash
+# List recent task definition revisions
+aws ecs list-task-definitions \
+  --family-prefix adma-backend \
+  --sort DESC \
+  --max-items 5
+
+# Update service to use a specific revision
+aws ecs update-service \
+  --cluster adma-cluster \
+  --service adma-backend \
+  --task-definition adma-backend:12 \
+  --force-new-deployment
+```
+
+### Method 2: Deploy Previous Image Tag
+
+<Steps>
+  <Step title="Find commit SHA">
+    Identify the commit SHA of the last known good deployment:
+    ```bash
+    git log --oneline -10
+    ```
+  </Step>
+
+  <Step title="Update task definition">
+    Edit `infrastructure/task-def-backend.json` to use the specific tag:
+    ```json
+    "image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/adma/backend:a1b2c3d"
+    ```
+  </Step>
+
+  <Step title="Register and deploy">
+    ```bash
+    aws ecs register-task-definition \
+      --cli-input-json file://infrastructure/task-def-backend.json
+
+    aws ecs update-service \
+      --cluster adma-cluster \
+      --service adma-backend \
+      --task-definition adma-backend:13 \
+      --force-new-deployment
+    ```
+  </Step>
+</Steps>
+
+### Method 3: Automatic Circuit Breaker Rollback
+
+With circuit breaker enabled, ECS automatically rolls back if:
+- New tasks fail health checks repeatedly
+- Deployment cannot reach steady state
+
+```hcl
+deployment_circuit_breaker {
+  enable   = true
+  rollback = true
+}
+```
+
+<Warning>
+Automatic rollback only works if the previous task definition is still available. Keep at least 3-5 recent revisions.
+</Warning>
+
+## Environment-Specific Deployments
+
+Support multiple environments (dev, staging, prod) by:
+
+### Option 1: Separate Workflows
+
+Create environment-specific workflow files:
+```
+.github/workflows/
+├── deploy-dev.yml
+├── deploy-staging.yml
+└── deploy-prod.yml
+```
+
+Each workflow targets different:
+- AWS account/region
+- ECS cluster name
+- ECR repository
+- GitHub secrets
+
+### Option 2: Workflow Inputs
+
+Use `workflow_dispatch` with manual environment selection:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      # Use environment-specific secrets
+      - name: Deploy to ${{ github.event.inputs.environment }}
+        # ...
+```
+
+## Production Checklist
+
+Before deploying to production:
+
+<AccordionGroup>
+<Accordion title="Security">
+- [ ] All secrets stored in AWS SSM Parameter Store or Secrets Manager
+- [ ] OIDC authentication configured (not long-lived access keys)
+- [ ] ECR repositories have vulnerability scanning enabled
+- [ ] Task execution role has minimal required permissions
+- [ ] No secrets hardcoded in Dockerfiles or task definitions
+</Accordion>
+
+<Accordion title="Configuration">
+- [ ] `VITE_API_BASE_URL` points to production API domain
+- [ ] `APP_BASE_URL` set to production short URL domain
+- [ ] `CORS_ALLOWED_ORIGINS` restricted to production domains
+- [ ] `JWT_SECRET` is random, secure (≥32 chars), and unique per environment
+- [ ] Database `ddl-auto` set to `validate` (not `update`)
+- [ ] RDS deletion protection enabled
+</Accordion>
+
+<Accordion title="Deployment Settings">
+- [ ] Circuit breaker enabled for automatic rollbacks
+- [ ] Health check grace period appropriate for startup time
+- [ ] `deployment_minimum_healthy_percent` set to 50% or higher
+- [ ] Blue-green deployment enabled (`deployment_maximum_percent = 200`)
+- [ ] `wait-for-service-stability` enabled in GitHub Actions
+</Accordion>
+
+<Accordion title="Monitoring">
+- [ ] CloudWatch log groups created with appropriate retention
+- [ ] Container Insights enabled
+- [ ] CloudWatch alarms configured for critical metrics
+- [ ] SNS topic created for alarm notifications
+- [ ] Deployment notifications sent to team (Slack, email, etc.)
+</Accordion>
+</AccordionGroup>
+
+## Troubleshooting Deployments
+
+Common issues and solutions:
+
+<AccordionGroup>
+<Accordion title="Task fails to start">
+**Symptoms**: Tasks transition to `STOPPED` immediately after starting
+
+**Causes**:
+- Missing or invalid secrets (check SSM parameter paths)
+- Container crashes on startup (check CloudWatch logs)
+- Insufficient resources (CPU/memory)
+
+**Debug**:
+```bash
+# Check stopped task reason
+aws ecs describe-tasks \
+  --cluster adma-cluster \
+  --tasks TASK_ID \
+  --query 'tasks[0].stoppedReason'
+
+# View container logs
+aws logs tail /ecs/adma-prod-backend --since 30m
+```
+</Accordion>
+
+<Accordion title="Health checks failing">
+**Symptoms**: Tasks start but fail ALB health checks
+
+**Causes**:
+- Application not listening on correct port
+- Health check path returns non-2xx status
+- Timeout too short for application startup
+
+**Debug**:
+```bash
+# Check target health
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:...
+
+# Test health endpoint from ECS Exec
+aws ecs execute-command \
+  --cluster adma-cluster \
+  --task TASK_ID \
+  --container backend \
+  --interactive \
+  --command "curl http://localhost:8080/actuator/health"
+```
+</Accordion>
+
+<Accordion title="Image pull errors">
+**Symptoms**: `CannotPullContainerError: Error response from daemon`
+
+**Causes**:
+- Incorrect ECR repository URL
+- Missing execution role permissions
+- Image tag doesn't exist
+
+**Debug**:
+```bash
+# Verify image exists
+aws ecr describe-images \
+  --repository-name adma/backend \
+  --image-ids imageTag=latest
+
+# Check execution role has ECR permissions
+aws iam get-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-name ECRAccessPolicy
+```
+</Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Configure [monitoring and alerts](/operations/monitoring) for deployed services
+- Learn [troubleshooting techniques](/operations/troubleshooting) for common issues
+- Review [security groups](/infrastructure/security-groups) and [secrets management](/infrastructure/secrets-management) for production

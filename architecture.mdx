@@ -1,0 +1,859 @@
+---
+title: Architecture
+description: Comprehensive architecture overview of the ADMA Cloud URL Shortener platform
+---
+
+## System Overview
+
+The ADMA Cloud URL Shortener is a modern, cloud-native application built with a decoupled architecture that supports both local development and AWS production deployments. The system provides anonymous and authenticated URL shortening with real-time analytics and automated lifecycle management.
+
+<Note>
+The platform supports two operational modes:
+- **Anonymous Mode**: Creates temporary links with an 8-hour TTL stored in localStorage
+- **Authenticated Mode**: Creates permanent links that persist in the database and can be managed by users
+</Note>
+
+## Architecture Diagrams
+
+<Tabs>
+  <Tab title="Local Development">
+    ```
+    Browser
+      │
+      ├─▶ http://localhost        → Frontend (Nginx :80)
+      │                              └─ React SPA
+      │
+      └─▶ http://localhost:8080   → Backend (Spring Boot :8080)
+                                     └─ PostgreSQL (localhost:5432)
+    ```
+    
+    **Local Stack Components:**
+    - **Frontend**: Nginx serving static React bundle
+    - **Backend**: Spring Boot application with embedded Tomcat
+    - **Database**: PostgreSQL 16 in Docker container
+    - **Orchestration**: Docker Compose manages all services
+  </Tab>
+  
+  <Tab title="AWS Production">
+    ```
+    Internet
+        │
+        ▼
+    Route 53 (DNS)
+        │
+        ▼
+    ACM Certificate (HTTPS)
+        │
+        ▼
+    Application Load Balancer  (443 → 80/8080)
+        │               │
+        │               │
+        ▼               ▼
+    ECS Service      ECS Service
+    (frontend)       (backend)
+    Fargate          Fargate
+    nginx:80         spring:8080
+        │               │
+        │               ▼
+        │           AWS RDS
+        │           PostgreSQL 16
+        │           (private subnet)
+        │
+        └─── Both services in private subnets
+             ALB in public subnet
+    ```
+    
+    **Production Infrastructure:**
+    - **Compute**: ECS Fargate (serverless containers)
+    - **Load Balancing**: Application Load Balancer with path-based routing
+    - **Database**: RDS PostgreSQL 16 Multi-AZ
+    - **Secrets**: AWS Secrets Manager for DB credentials and JWT secret
+    - **Networking**: VPC with public/private subnets across availability zones
+    - **Logging**: CloudWatch Logs with configurable retention
+    - **Auto-scaling**: CPU and memory-based scaling policies
+  </Tab>
+</Tabs>
+
+## Technology Stack
+
+### Backend
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| **Java** | 21 LTS | Runtime platform with long-term support |
+| **Spring Boot** | 3.4.2 | Application framework (Web, Security, Data JPA, Validation) |
+| **Hibernate** | 6.6.5 | ORM layer with automatic schema management |
+| **JJWT** | 0.12.6 | JWT token generation and validation (HS256) |
+| **BCrypt** | Strength 12 | Password hashing per OWASP recommendations |
+| **PostgreSQL Driver** | 42.7.5 | Database connectivity |
+| **ShedLock** | 6.3.0 | Distributed locking for scheduled tasks |
+| **Gradle** | 9.3.0 | Build automation and dependency management |
+
+<Info>
+**Security Hardening**: The backend uses BCrypt with a cost factor of 12 for password hashing, stateless JWT authentication, and environment-based secret management. See [SecurityConfig.java:59](source://backend/src/main/java/adma/sa2_sa3/backend/config/SecurityConfig.java#L59)
+</Info>
+
+### Frontend
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| **React** | 18 | UI framework with hooks and concurrent features |
+| **TypeScript** | 5 | Type-safe development with strict mode |
+| **Vite** | 5 | Fast build tool and dev server |
+| **React Router** | 6 | Client-side routing |
+| **Tailwind CSS** | 3 | Utility-first CSS framework |
+| **shadcn/ui** | Latest | Accessible component library built on Radix UI |
+| **Framer Motion** | Latest | Animation library for smooth transitions |
+| **TanStack Query** | 5 | Server state management and caching |
+| **Bun** | Latest | Fast package manager and build runner |
+
+<Note>
+**Build-Time Configuration**: The frontend uses Vite's environment variable system where `VITE_API_BASE_URL` is baked into the bundle at build time. This value cannot be changed at runtime and must be provided during the Docker image build.
+</Note>
+
+### Infrastructure
+
+<Accordion title="AWS Services Overview">
+
+| Service | Component | Purpose |
+|---------|-----------|---------|
+| **ECR** | Elastic Container Registry | Docker image storage with vulnerability scanning |
+| **ECS Fargate** | Compute | Serverless container orchestration (no EC2 management) |
+| **RDS** | Database | PostgreSQL 16 with automated backups and Multi-AZ support |
+| **ALB** | Load Balancer | Layer 7 load balancing with path-based routing |
+| **ACM** | Certificate Manager | Free SSL/TLS certificates with auto-renewal |
+| **Route 53** | DNS | Domain name resolution |
+| **Secrets Manager** | Secrets Storage | Encrypted storage for DB passwords and JWT secrets |
+| **CloudWatch** | Logging & Monitoring | Centralized log aggregation and metrics |
+| **VPC** | Networking | Isolated network with public/private subnets |
+| **VPC Endpoints** | Private Connectivity | Interface endpoints for ECR, CloudWatch, and Secrets Manager |
+| **Service Discovery** | Cloud Map | Internal DNS for backend service discovery |
+
+</Accordion>
+
+## Component Interactions
+
+### Request Flow
+
+<Tabs>
+  <Tab title="Anonymous URL Creation">
+    ```
+    1. User submits URL via frontend form
+       └─> POST /api/urls/public
+    
+    2. Backend creates ShortUrl entity
+       ├─> linkType: ANONYMOUS
+       ├─> expiresAt: now() + 8 hours
+       └─> shortCode: 7-character random alphanumeric
+    
+    3. Backend saves to PostgreSQL
+       └─> Returns shortCode and expiresAt
+    
+    4. Frontend stores in localStorage
+       └─> Key: "anonymous_urls"
+       └─> TTL: 8 hours (28,800,000ms)
+    
+    5. User can share the short URL immediately
+    ```
+  </Tab>
+  
+  <Tab title="Authenticated URL Creation">
+    ```
+    1. User logs in
+       ├─> POST /api/auth/login
+       └─> Receives JWT token (24h validity)
+    
+    2. User submits URL with JWT
+       ├─> Authorization: Bearer <token>
+       └─> POST /api/urls
+    
+    3. Backend validates JWT
+       └─> JwtAuthenticationFilter extracts userId
+    
+    4. Backend creates permanent ShortUrl
+       ├─> linkType: PERMANENT
+       ├─> expiresAt: null
+       ├─> userId: from JWT
+       └─> shortCode: 7-character random
+    
+    5. Frontend displays in user's dashboard
+       └─> Can delete, copy, and view analytics
+    ```
+  </Tab>
+  
+  <Tab title="URL Redirect">
+    ```
+    1. Browser navigates to /{shortCode}
+       └─> GET /{shortCode}
+    
+    2. Backend looks up shortCode in database
+       └─> SELECT * FROM short_url WHERE short_code = ?
+    
+    3. Backend checks link status
+       ├─> If NOT_FOUND: return 404
+       ├─> If EXPIRED: return 410 Gone
+       └─> If ACTIVE: proceed
+    
+    4. Backend measures redirect latency
+       └─> Updates average using Welford's algorithm
+    
+    5. Backend increments click count
+       └─> UPDATE short_url SET clicks = clicks + 1
+    
+    6. Returns 302 Found redirect
+       └─> Location: {originalUrl}
+    ```
+  </Tab>
+</Tabs>
+
+### Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Frontend (React SPA)                                           │
+│  ┌──────────────────┐        ┌──────────────────┐               │
+│  │  AuthContext     │        │  localStorage    │               │
+│  │  - JWT token     │◄──────►│  - JWT token     │               │
+│  │  - User info     │        │  - Anonymous URLs│               │
+│  └──────────────────┘        └──────────────────┘               │
+│           │                                                      │
+│           │ HTTP + JWT                                          │
+└───────────┼──────────────────────────────────────────────────────┘
+            │
+            │ HTTPS (443)
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Application Load Balancer                                      │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │  Path-based routing:                                        ││
+│  │  • /api/* → Backend Target Group                            ││
+│  │  • /* → Frontend Target Group                               ││
+│  └─────────────────────────────────────────────────────────────┘│
+└───────────┬────────────────────────────┬────────────────────────┘
+            │                            │
+            ▼                            ▼
+┌───────────────────────┐    ┌───────────────────────────────────┐
+│  Backend Service      │    │  Frontend Service                 │
+│  Spring Boot :8080    │    │  Nginx :80                        │
+│  ┌─────────────────┐  │    │  ┌──────────────────────────────┐ │
+│  │ Controllers     │  │    │  │  Static Assets               │ │
+│  │ - Auth          │  │    │  │  - index.html                │ │
+│  │ - ShortUrl      │  │    │  │  - JS bundle (Vite)          │ │
+│  │ - Redirect      │  │    │  │  - CSS bundle (Tailwind)     │ │
+│  │ - Stats         │  │    │  └──────────────────────────────┘ │
+│  └────────┬────────┘  │    └───────────────────────────────────┘
+│           │           │
+│  ┌────────▼────────┐  │
+│  │ Security Filter │  │
+│  │ - JWT validation│  │
+│  └────────┬────────┘  │
+│           │           │
+│  ┌────────▼────────┐  │
+│  │ Service Layer   │  │
+│  │ - ShortUrlSvc   │  │
+│  │ - AuthService   │  │
+│  └────────┬────────┘  │
+│           │           │
+│  ┌────────▼────────┐  │
+│  │ JPA Repositories│  │
+│  │ - ShortUrlRepo  │  │
+│  │ - UserRepo      │  │
+│  └────────┬────────┘  │
+└───────────┼───────────┘
+            │ JDBC
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  RDS PostgreSQL 16                                              │
+│  ┌──────────────────┐  ┌──────────────────┐                     │
+│  │  short_url       │  │  users           │                     │
+│  │  - id            │  │  - id            │                     │
+│  │  - short_code    │  │  - email         │                     │
+│  │  - original_url  │  │  - password_hash │                     │
+│  │  - user_id       │  │  - name          │                     │
+│  │  - clicks        │  │  - created_at    │                     │
+│  │  - link_type     │  └──────────────────┘                     │
+│  │  - expires_at    │                                           │
+│  │  - created_at    │  ┌──────────────────┐                     │
+│  │  - avg_latency   │  │  shedlock        │                     │
+│  └──────────────────┘  │  - name          │                     │
+│                        │  - lock_until    │                     │
+│                        │  - locked_at     │                     │
+│                        └──────────────────┘                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Key Architectural Patterns
+
+### Stateless JWT Authentication
+
+The backend uses stateless JWT tokens for authentication, eliminating the need for server-side session storage:
+
+```java
+// SecurityConfig.java:90
+.sessionManagement(sm ->
+    sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+```
+
+**Benefits:**
+- Horizontal scalability (no session affinity required)
+- Reduced server memory footprint
+- Supports distributed deployments
+- Token contains all authentication context
+
+<Info>
+JWT tokens are signed with HS256 using a secret stored in AWS Secrets Manager. The secret is automatically injected into the ECS task at runtime via the task definition's `secrets` parameter.
+</Info>
+
+### Multi-Stage Docker Builds
+
+Both frontend and backend use multi-stage Dockerfiles to minimize production image size:
+
+<Accordion title="Backend Dockerfile">
+
+```dockerfile
+# Stage 1: Build with full Gradle toolchain
+FROM gradle:8.5-jdk21 AS builder
+WORKDIR /app
+COPY build.gradle settings.gradle ./
+RUN gradle dependencies --no-daemon || true
+COPY src ./src
+RUN gradle bootJar --no-daemon -x test
+
+# Stage 2: Minimal runtime with JRE only
+FROM eclipse-temurin:21-jre-alpine AS runtime
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+WORKDIR /app
+COPY --from=builder /app/build/libs/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+```
+
+**Result:** ~200MB runtime image (vs. ~800MB with full JDK)
+
+</Accordion>
+
+<Accordion title="Frontend Dockerfile">
+
+```dockerfile
+# Stage 1: Build static assets
+FROM node:20-alpine AS build
+WORKDIR /app
+ARG VITE_API_BASE_URL=http://localhost:8080
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+COPY package*.json ./
+RUN npm install -g bun && bun install
+COPY . .
+RUN bun run build
+
+# Stage 2: Serve with Nginx
+FROM nginx:stable-alpine AS production
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**Result:** ~40MB runtime image (vs. ~400MB with Node.js)
+
+</Accordion>
+
+### Scheduled Job Coordination
+
+The backend includes an automated cleanup service that runs every 15 minutes to remove expired anonymous links:
+
+```java
+// BackendApplication.java:17
+@EnableScheduling
+public class BackendApplication {
+    // ExpiredUrlCleanupService runs @Scheduled(cron = "0 */15 * * * *")
+}
+```
+
+<Note>
+**Production Consideration**: The cleanup job uses ShedLock to ensure only one instance executes the task in multi-instance deployments. The lock is stored in a PostgreSQL table (`shedlock`) shared by all backend instances.
+</Note>
+
+### Distributed Locking with ShedLock
+
+To prevent duplicate execution of scheduled tasks in scaled deployments:
+
+```gradle
+// build.gradle:49
+implementation 'net.javacrumbs.shedlock:shedlock-spring:6.3.0'
+implementation 'net.javacrumbs.shedlock:shedlock-provider-jdbc-template:6.3.0'
+```
+
+**How it works:**
+1. Before executing a scheduled task, ShedLock attempts to acquire a database lock
+2. If the lock is held by another instance, the task is skipped
+3. Lock duration ensures execution even if instance crashes
+4. Zero external dependencies (uses existing PostgreSQL)
+
+### Infrastructure as Code
+
+The entire AWS infrastructure is defined using Terraform with a modular architecture:
+
+```
+infrastructure/terraform/
+├── main.tf                    # Root orchestration
+├── modules/
+│   ├── network/              # VPC, subnets, routing
+│   ├── security/             # Security groups
+│   ├── ecr/                  # Container registries
+│   ├── ecs/                  # Fargate services, ALB
+│   ├── rds/                  # PostgreSQL database
+│   ├── iam/                  # IAM roles and policies
+│   └── vpc_endpoints/        # Private AWS service access
+```
+
+<Info>
+**Key Features:**
+- **Precondition Validation**: Enforces required variables before apply
+- **Automatic Secret Generation**: Creates secure random JWT secrets
+- **Service Discovery**: Backend accessible via Cloud Map private DNS
+- **Auto-scaling**: CPU and memory-based scaling policies for both services
+- **Circuit Breakers**: Automatic rollback on failed deployments
+</Info>
+
+## Security Architecture
+
+### Network Isolation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  VPC (10.0.0.0/16)                                              │
+│                                                                 │
+│  ┌──────────────────────────┐  Public Subnets                  │
+│  │  Internet Gateway        │  (10.0.1.0/24, 10.0.2.0/24)      │
+│  └─────────┬────────────────┘                                  │
+│            │                                                    │
+│            ▼                                                    │
+│  ┌──────────────────────────┐                                  │
+│  │  Application Load Balancer│  Security Group: sg-ALB         │
+│  │  - Ports: 80, 443         │  - Inbound: 0.0.0.0/0:80,443   │
+│  └─────────┬────────────────┘  - Outbound: All                │
+│            │                                                    │
+│  ──────────┼────────── NAT Gateway                             │
+│            │                                                    │
+│            ▼                                                    │
+│  Private Subnets (10.0.10.0/24, 10.0.11.0/24)                  │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐    │
+│  │  Frontend Tasks          │  │  Backend Tasks           │    │
+│  │  Security Group:         │  │  Security Group:         │    │
+│  │  sg-FRONTEND             │  │  sg-BACKEND              │    │
+│  │  - Inbound: sg-ALB:80    │  │  - Inbound: sg-ALB:8080  │    │
+│  │  - Outbound: All         │  │  - Outbound: sg-RDS:5432 │    │
+│  └──────────────────────────┘  └────────┬─────────────────┘    │
+│                                          │                      │
+│                                          ▼                      │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  RDS PostgreSQL                                           │ │
+│  │  Security Group: sg-RDS                                   │ │
+│  │  - Inbound: sg-BACKEND:5432                               │ │
+│  │  - No public access                                       │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  VPC Endpoints (PrivateLink)                              │ │
+│  │  - com.amazonaws.region.ecr.api                           │ │
+│  │  - com.amazonaws.region.ecr.dkr                           │ │
+│  │  - com.amazonaws.region.s3 (gateway)                      │ │
+│  │  - com.amazonaws.region.logs                              │ │
+│  │  - com.amazonaws.region.secretsmanager                    │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Secrets Management
+
+<Tabs>
+  <Tab title="Local Development">
+    ```yaml
+    # docker-compose.yml
+    services:
+      backend:
+        environment:
+          JWT_SECRET: ${JWT_SECRET:-changeme-this-must-be-at-least-32-chars-long!!}
+          DB_PASSWORD: ${DB_PASSWORD:-changeme}
+    ```
+    
+    Secrets are stored in `.env` file (never committed to git).
+  </Tab>
+  
+  <Tab title="AWS Production">
+    ```hcl
+    # Terraform automatically creates secrets
+    resource "aws_secretsmanager_secret" "jwt" {
+      name = "/${var.project_name}/${var.environment}/jwt-secret"
+    }
+    
+    resource "random_password" "jwt_secret" {
+      length  = 64
+      special = true
+    }
+    
+    # ECS task definition references secret ARN
+    secrets = [
+      {
+        name      = "JWT_SECRET"
+        valueFrom = aws_secretsmanager_secret.jwt.arn
+      }
+    ]
+    ```
+    
+    **Security Features:**
+    - Secrets never stored in code or container images
+    - Automatic rotation support
+    - IAM-based access control
+    - Audit logging via CloudTrail
+  </Tab>
+</Tabs>
+
+## Performance Optimizations
+
+### Welford's Algorithm for Latency Tracking
+
+The backend tracks average redirect latency using Welford's online algorithm, which computes running averages without storing historical data:
+
+```
+μₙ = μₙ₋₁ + (xₙ − μₙ₋₁) / n
+
+Where:
+- μₙ = new average
+- μₙ₋₁ = previous average
+- xₙ = new measurement
+- n = total count
+```
+
+**Benefits:**
+- O(1) memory usage (constant, regardless of click count)
+- O(1) computational complexity per update
+- Numerically stable for large datasets
+
+### Frontend State Management
+
+<Accordion title="TanStack Query Configuration">
+
+The frontend uses TanStack Query (React Query) for efficient server state management:
+
+```typescript
+// Features:
+// - Automatic background refetching
+// - Optimistic updates
+// - Request deduplication
+// - Cache invalidation strategies
+// - Retry logic with exponential backoff
+
+const { data: urls } = useQuery({
+  queryKey: ['urls'],
+  queryFn: fetchUrls,
+  staleTime: 30000,      // Consider fresh for 30 seconds
+  cacheTime: 300000,     // Keep in cache for 5 minutes
+  refetchOnWindowFocus: true,
+});
+```
+
+</Accordion>
+
+### Database Indexing Strategy
+
+Key indexes for optimal query performance:
+
+```sql
+-- Unique index on short_code (most frequent lookup)
+CREATE UNIQUE INDEX idx_short_url_code ON short_url(short_code);
+
+-- Index on user_id for dashboard queries
+CREATE INDEX idx_short_url_user ON short_url(user_id);
+
+-- Composite index for cleanup job
+CREATE INDEX idx_short_url_expired ON short_url(link_type, expires_at)
+  WHERE expires_at IS NOT NULL;
+
+-- Index on email for login
+CREATE UNIQUE INDEX idx_user_email ON users(email);
+```
+
+## Monitoring and Observability
+
+### CloudWatch Integration
+
+<Tabs>
+  <Tab title="Application Logs">
+    ```
+    Log Groups:
+    ├─ /ecs/adma-prod-frontend
+    │  └─ Nginx access/error logs
+    └─ /ecs/adma-prod-backend
+       ├─ Spring Boot application logs
+       ├─ SQL query logs (when enabled)
+       └─ Exception stack traces
+    ```
+    
+    **Log Retention**: Configurable via `ecs_log_retention_days` (default: 30 days)
+  </Tab>
+  
+  <Tab title="Container Metrics">
+    ```
+    ECS Container Insights:
+    ├─ CPU utilization (%)
+    ├─ Memory utilization (%)
+    ├─ Network throughput (bytes/sec)
+    ├─ Task count
+    └─ Health check status
+    ```
+    
+    **Auto-scaling Triggers**:
+    - Frontend: CPU > 70% or Memory > 80%
+    - Backend: CPU > 70% or Memory > 80%
+  </Tab>
+  
+  <Tab title="RDS Metrics">
+    ```
+    Database Monitoring:
+    ├─ Connection count
+    ├─ CPU utilization
+    ├─ Storage usage
+    ├─ Query performance (via Performance Insights)
+    ├─ Replication lag (Multi-AZ)
+    └─ Backup status
+    ```
+  </Tab>
+</Tabs>
+
+### Health Checks
+
+<Accordion title="Health Check Configuration">
+
+**Frontend Health Check:**
+```dockerfile
+# Dockerfile health check
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -q -O /dev/null http://localhost:80/ || exit 1
+```
+
+**Backend Health Check:**
+```dockerfile
+# Uses Spring Boot Actuator
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+  CMD wget -q -O /dev/null http://localhost:8080/actuator/health || exit 1
+```
+
+**Target Group Health Checks:**
+- **Frontend**: `GET /` expecting 200-399
+- **Backend**: `GET /actuator/health` expecting 200
+
+</Accordion>
+
+## Deployment Strategy
+
+### Blue-Green Deployments
+
+ECS services are configured with deployment circuit breakers for safe updates:
+
+```hcl
+deployment_circuit_breaker {
+  enable   = true
+  rollback = true
+}
+
+deployment_maximum_percent        = 200  # Allow 2x capacity during deploy
+deployment_minimum_healthy_percent = 50   # Maintain at least 50% capacity
+```
+
+**Deployment Flow:**
+1. New task revision is created with updated container image
+2. ECS launches new tasks alongside existing tasks (up to 200% capacity)
+3. New tasks must pass health checks
+4. Traffic gradually shifts to new tasks
+5. Old tasks are drained and terminated
+6. If health checks fail, automatic rollback to previous revision
+
+### CI/CD Pipeline
+
+<Accordion title="GitHub Actions Workflow">
+
+```yaml
+# .github/workflows/deploy.yml highlights:
+
+1. Build Phase:
+   - Checkout code
+   - Build Docker images with git SHA tags
+   - Scan images for vulnerabilities (ECR)
+   - Push to ECR with both :latest and :${{ github.sha }} tags
+
+2. Deploy Phase:
+   - Update ECS task definitions
+   - Trigger service updates
+   - Wait for deployment stability
+   - Monitor health checks
+
+3. Rollback:
+   - If deployment fails, circuit breaker auto-reverts
+   - Manual rollback: update service to previous task definition revision
+```
+
+**Required GitHub Secrets:**
+- `AWS_ACCOUNT_ID`: AWS account number
+- `VITE_API_BASE_URL`: Frontend API endpoint (build-time)
+
+</Accordion>
+
+## Scaling Characteristics
+
+### Horizontal Scaling
+
+| Component | Min | Desired | Max | Scaling Metric |
+|-----------|-----|---------|-----|----------------|
+| Frontend | 1 | 2 | 10 | CPU > 70% OR Memory > 80% |
+| Backend | 1 | 1 | 5 | CPU > 70% OR Memory > 80% |
+| RDS | - | 1 | - | Manual (change instance class) |
+
+<Note>
+**Backend Scaling Consideration**: The scheduled cleanup job uses ShedLock to prevent concurrent execution. Scaling to multiple instances is safe and recommended for high availability.
+</Note>
+
+### Vertical Scaling
+
+<Tabs>
+  <Tab title="Frontend">
+    ```hcl
+    frontend_task_cpu    = 256   # 0.25 vCPU
+    frontend_task_memory = 512   # 512 MB
+    ```
+    
+    Typical resource usage: ~10% CPU, ~100MB memory
+  </Tab>
+  
+  <Tab title="Backend">
+    ```hcl
+    backend_task_cpu    = 512   # 0.5 vCPU
+    backend_task_memory = 1024  # 1 GB
+    ```
+    
+    Typical resource usage: ~30% CPU, ~400MB memory
+  </Tab>
+  
+  <Tab title="Database">
+    ```hcl
+    db_instance_class = "db.t3.micro"  # 2 vCPU, 1 GB RAM
+    
+    # Scale up options:
+    # - db.t3.small   (2 vCPU, 2 GB)
+    # - db.t3.medium  (2 vCPU, 4 GB)
+    # - db.m5.large   (2 vCPU, 8 GB)
+    ```
+  </Tab>
+</Tabs>
+
+## Cost Optimization
+
+### Resource Rightsizing
+
+<Accordion title="Cost Breakdown (Estimated)">
+
+**Monthly AWS Costs (us-east-1, approximate):**
+
+| Service | Configuration | Monthly Cost |
+|---------|---------------|--------------|
+| ECS Fargate | 2 frontend tasks (0.25 vCPU, 512MB) | ~$15 |
+| ECS Fargate | 1 backend task (0.5 vCPU, 1GB) | ~$15 |
+| RDS PostgreSQL | db.t3.micro, 20GB gp3 | ~$20 |
+| ALB | 1 ALB with minimal traffic | ~$20 |
+| Data Transfer | Under 100GB/month | ~$10 |
+| CloudWatch Logs | 30-day retention, under 10GB | ~$5 |
+| **Total** | | **~$85/month** |
+
+**Cost Optimization Strategies:**
+- Use Savings Plans or Compute Savings Plans for ECS Fargate (up to 50% savings)
+- Enable RDS storage autoscaling to avoid over-provisioning
+- Set CloudWatch log retention to 7-14 days in development environments
+- Use VPC endpoints to avoid NAT Gateway data transfer charges ($0.045/GB)
+
+</Accordion>
+
+## High Availability
+
+### Multi-AZ Deployment
+
+```
+Availability Zone A              Availability Zone B
+┌──────────────────────┐        ┌──────────────────────┐
+│                      │        │                      │
+│  Public Subnet       │        │  Public Subnet       │
+│  ┌────────────────┐  │        │  ┌────────────────┐  │
+│  │  ALB (active)  │◄─┼────────┼─►│  ALB (active)  │  │
+│  └────────────────┘  │        │  └────────────────┘  │
+│                      │        │                      │
+│  Private Subnet      │        │  Private Subnet      │
+│  ┌────────────────┐  │        │  ┌────────────────┐  │
+│  │  ECS Tasks     │  │        │  │  ECS Tasks     │  │
+│  │  - Frontend    │  │        │  │  - Frontend    │  │
+│  │  - Backend     │  │        │  │  - Backend     │  │
+│  └────────────────┘  │        │  └────────────────┘  │
+│          │           │        │          │           │
+│          ▼           │        │          ▼           │
+│  ┌────────────────┐  │        │  ┌────────────────┐  │
+│  │  RDS Primary   │◄─┼────────┼─►│  RDS Standby   │  │
+│  │  (active)      │  │ Sync   │  │  (passive)     │  │
+│  └────────────────┘  │ Repl.  │  └────────────────┘  │
+└──────────────────────┘        └──────────────────────┘
+```
+
+**High Availability Features:**
+- ALB distributes traffic across availability zones
+- ECS tasks can run in multiple AZs
+- RDS Multi-AZ provides automatic failover (< 2 minutes)
+- Automated backups with point-in-time recovery
+
+## Disaster Recovery
+
+### Backup Strategy
+
+<Tabs>
+  <Tab title="Database Backups">
+    ```hcl
+    db_backup_retention_days = 7  # Automated daily backups
+    
+    # Point-in-time recovery:
+    # - Restore to any second within retention period
+    # - Transaction log backups every 5 minutes
+    ```
+    
+    **Recovery Time Objective (RTO)**: ~30 minutes
+    **Recovery Point Objective (RPO)**: Under 5 minutes
+  </Tab>
+  
+  <Tab title="Infrastructure Recovery">
+    ```bash
+    # Entire infrastructure can be recreated via Terraform:
+    cd infrastructure/terraform
+    terraform init
+    terraform plan
+    terraform apply
+    
+    # Time to restore: ~15 minutes
+    ```
+    
+    **Critical artifacts to preserve:**
+    - Terraform state (stored in S3 backend)
+    - ECR container images
+    - RDS automated backups
+    - Secrets Manager values
+  </Tab>
+</Tabs>
+
+## Next Steps
+
+<Card title="Deployment Guide" icon="rocket" href="/deployment/aws-setup">
+  Complete guide to deploying on AWS ECS Fargate
+</Card>
+
+<Card title="API Reference" icon="code" href="/api/authentication">
+  Explore the REST API endpoints and authentication
+</Card>
+
+<Card title="Configuration" icon="gear" href="/api/environment-variables">
+  Configure environment variables and customize behavior
+</Card>
