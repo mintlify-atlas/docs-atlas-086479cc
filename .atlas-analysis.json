@@ -1,0 +1,103 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "ADMA Cloud Administration",
+  "projectDescription": "Cloud-native URL shortener with Spring Boot backend, React frontend, and complete AWS infrastructure deployment using Terraform and ECS Fargate.",
+  "theme": "aspen",
+  "primaryColor": "#2563eb",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e40af",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Getting Started",
+            "pages": [
+              "quickstart",
+              "local-development"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/aws-setup",
+              "deployment/ecr-images",
+              "deployment/rds-database",
+              "deployment/ecs-fargate",
+              "deployment/load-balancer",
+              "deployment/https-ssl"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "infrastructure/terraform",
+              "infrastructure/networking",
+              "infrastructure/security-groups",
+              "infrastructure/secrets-management"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/monitoring",
+              "operations/cicd",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/authentication",
+              "api/url-management",
+              "api/statistics",
+              "api/redirect"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "api/environment-variables",
+              "api/business-rules"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "AWS ECS Fargate serverless deployment",
+    "Spring Boot 3.4 REST API with JWT authentication",
+    "React 18 SPA with TypeScript and Tailwind CSS",
+    "Terraform infrastructure as code with modular design",
+    "PostgreSQL RDS with multi-AZ support",
+    "Application Load Balancer with HTTPS",
+    "Docker Compose for local development",
+    "Automated URL cleanup with distributed locking",
+    "Real-time analytics and statistics"
+  ],
+  "publicApiSurface": [
+    "POST /api/auth/register - User registration",
+    "POST /api/auth/login - User authentication",
+    "POST /api/urls - Create short URL (authenticated)",
+    "POST /api/urls/public - Create anonymous short URL",
+    "GET /api/urls - List user's URLs",
+    "DELETE /api/urls/{id} - Delete URL",
+    "POST /api/urls/sync - Sync anonymous URLs to account",
+    "GET /{shortCode} - Redirect to original URL",
+    "GET /api/stats - Public statistics endpoint"
+  ]
+}
